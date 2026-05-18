@@ -13,7 +13,6 @@ import {
 	type SingleResult,
 	type SubagentDetails,
 	type UsageStats,
-	aggregateUsage,
 	getDisplayItems,
 	getFinalOutput,
 	isResultError,
@@ -58,7 +57,7 @@ function shortenPath(p: string): string {
 type ThemeFg = (color: string, text: string) => string;
 
 function formatToolCall(toolName: string, args: Record<string, unknown>, fg: ThemeFg): string {
-	const pathArg = (args.file_path || args.path || "...") as string;
+	const pathArg = (args.file_path || args.path || args.name || "...") as string;
 
 	switch (toolName) {
 		case "bash": {
@@ -152,7 +151,7 @@ function statusIcon(r: SingleResult, theme: { fg: ThemeFg }): string {
 // ---------------------------------------------------------------------------
 
 export function renderCall(args: Record<string, any>, theme: { fg: ThemeFg; bold: (s: string) => string }): Text {
-	const agentName = args.agent || "...";
+	const agentName = args.name || args.agent || "...";
 	const preview = args.task ? truncate(args.task, 60) : "...";
 	let text =
 		theme.fg("toolTitle", theme.bold("subagent ")) +
@@ -212,7 +211,7 @@ function renderSingleExpanded(
 	const container = new Container();
 
 	// Header
-	let header = `${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}${theme.fg("muted", ` (${r.agentSource})`)}`;
+	let header = `${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}`;
 	if (error && r.stopReason) header += ` ${theme.fg("error", `[${r.stopReason}]`)}`;
 	container.addChild(new Text(header, 0, 0));
 	if (error && r.errorMessage) {
@@ -259,7 +258,7 @@ function renderSingleCollapsed(
 	displayItems: DisplayItem[],
 	theme: { fg: ThemeFg; bold: (s: string) => string },
 ): Text {
-	let text = `${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}${theme.fg("muted", ` (${r.agentSource})`)}`;
+	let text = `${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}`;
 	if (error && r.stopReason) text += ` ${theme.fg("error", `[${r.stopReason}]`)}`;
 
 	if (error && r.errorMessage) {

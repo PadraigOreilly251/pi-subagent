@@ -86,6 +86,23 @@ export function processPiEvent(event, result) {
     return false;
   }
 
+  // Block sub-agents from spawning further sub-agents
+  // This is enforced at the runner level (not via system prompt) for reliability
+  if (event.type === "message_end" && event.message?.role === "assistant") {
+    const content = event.message.content;
+    if (Array.isArray(content)) {
+      for (const part of content) {
+        if (part?.type === "toolCall" && part?.name === "subagent") {
+          result.stopReason = "subagent_recursion_blocked";
+          result.errorMessage = "Sub-agents are not allowed to spawn further sub-agents.";
+          result.stderr = result.errorMessage;
+          result.exitCode = 1;
+          return false;
+        }
+      }
+    }
+  }
+
   switch (event.type) {
     case "message_end":
       return addAssistantMessage(result, event.message);

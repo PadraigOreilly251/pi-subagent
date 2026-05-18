@@ -1,8 +1,9 @@
 /**
  * Shared type definitions for the subagent extension.
  *
- * Phase 1: Single sub-agent only. Fork mode (full context inheritance).
- * No parallel execution. No spawn mode.
+ * Simplified model: sub-agents are identified by a freeform name,
+ * inherit the parent's model/tools/thinking, and cannot spawn further
+ * sub-agents (enforced at the runner level).
  */
 
 import type { Message } from "@mariozechner/pi-ai";
@@ -21,8 +22,9 @@ export interface UsageStats {
 
 /** Result of a single subagent invocation. */
 export interface SingleResult {
+	/** Freeform name given to the sub-agent. */
 	agent: string;
-	agentSource: "user" | "project" | "unknown";
+	/** Task description passed to the sub-agent. */
 	task: string;
 	exitCode: number;
 	messages: Message[];
@@ -32,13 +34,12 @@ export interface SingleResult {
 	stopReason?: string;
 	errorMessage?: string;
 	sawAgentEnd?: boolean;
-	timeout?: boolean; // true if killed due to timeout
-	maxTurns?: number; // max turns limit (set by runner for enforcement)
+	timeout?: boolean;
+	maxTurns?: boolean;
 }
 
 /** Metadata attached to every tool result for rendering. */
 export interface SubagentDetails {
-	projectAgentsDir: string | null;
 	results: SingleResult[];
 }
 
@@ -78,32 +79,21 @@ export function hasSemanticCompletion(r: Pick<SingleResult, "messages" | "sawAge
 
 /** Whether a result should be treated as successful by the wrapper/UI. */
 export function isResultSuccess(r: SingleResult): boolean {
-	const sc = hasSemanticCompletion(r);
-	const exitNotMinus1 = r.exitCode !== -1;
-	const notTimeoutOrMaxTurns = r.stopReason !== "timeout" && r.stopReason !== "max_turns";
-	const exitCodeZero = r.exitCode === 0;
-	const notErrorAborted = r.stopReason !== "error" && r.stopReason !== "aborted";
-	console.error(`[DEBUG isResultSuccess] exitCode=${r.exitCode} stopReason=${r.stopReason} errorMessage=${r.errorMessage} sawAgentEnd=${r.sawAgentEnd} messages.length=${r.messages.length} sc=${sc} exitNotMinus1=${exitNotMinus1} notTimeoutOrMaxTurns=${notTimeoutOrMaxTurns} exitCodeZero=${exitCodeZero} notErrorAborted=${notErrorAborted}`);
 	if (r.exitCode === -1) return false;
-	// Explicitly reject timeout and max_turns even with semantic completion
 	if (r.stopReason === "timeout" || r.stopReason === "max_turns") return false;
-	if (sc) return true;
+	if (hasSemanticCompletion(r)) return true;
 	return r.exitCode === 0 && r.stopReason !== "error" && r.stopReason !== "aborted";
 }
 
 /** Whether a result represents an error. */
 export function isResultError(r: SingleResult): boolean {
-	const exitNotMinus1 = r.exitCode !== -1;
-	const success = isResultSuccess(r);
-	console.error(`[DEBUG isResultError] exitNotMinus1=${exitNotMinus1} success=${success} => ${!success}`);
 	if (r.exitCode === -1) return false;
-	return !success;
+	return !isResultSuccess(r);
 }
 
-//** Reconcile process exit status with semantic completion observed from Pi's event stream. */
+/** Reconcile process exit status with semantic completion observed from Pi's event stream. */
 export function normalizeCompletedResult(result: SingleResult, wasAborted: boolean): SingleResult {
 	const hasSemanticSuccess = hasSemanticCompletion(result);
-	console.error(`[DEBUG normalizeCompletedResult] BEFORE: exitCode=${result.exitCode} stopReason=${result.stopReason} sawAgentEnd=${result.sawAgentEnd} messages.length=${result.messages.length} hasSemanticSuccess=${hasSemanticSuccess} wasAborted=${wasAborted} timeout=${result.timeout} maxTurns=${result.maxTurns} stderr=${result.stderr.substring(0,100)}`);
 
 	if (wasAborted) {
 		if (hasSemanticSuccess) {
@@ -121,7 +111,6 @@ export function normalizeCompletedResult(result: SingleResult, wasAborted: boole
 		return result;
 	}
 
-	// Handle timeout (runner already set exitCode, stopReason, errorMessage)
 	if (result.timeout) {
 		result.exitCode = 124;
 		result.stopReason = "timeout";
@@ -132,7 +121,6 @@ export function normalizeCompletedResult(result: SingleResult, wasAborted: boole
 		return result;
 	}
 
-	// Handle max turns exceeded (runner already set exitCode, stopReason, errorMessage)
 	if (result.maxTurns) {
 		result.exitCode = 1;
 		result.stopReason = "max_turns";
@@ -158,7 +146,6 @@ export function normalizeCompletedResult(result: SingleResult, wasAborted: boole
 		}
 	}
 
-	console.error(`[DEBUG normalizeCompletedResult] AFTER: exitCode=${result.exitCode} stopReason=${result.stopReason} errorMessage=${result.errorMessage}`);
 	return result;
 }
 

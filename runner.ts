@@ -1,11 +1,14 @@
 /**
- * Subagent process runner (Phase 1).
+ * Subagent process runner.
  *
  * Spawns isolated `pi` subprocesses with full context inheritance.
  * Sub-agents inherit the exact same system prompt as the main agent
  * (no --append-system-prompt). Task is delivered as a user message.
  *
- * No parallel execution. No spawn mode. Only fork (full context).
+ * Simplified model:
+ * - No named agents or config files
+ * - Sub-agents inherit parent's model/tools/thinking
+ * - Sub-agents cannot spawn further sub-agents (enforced in runner-events.js)
  */
 
 import { spawn } from "node:child_process";
@@ -13,12 +16,10 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentToolResult } from "@mariozechner/pi-agent-core";
-import type { AgentConfig } from "./agents.js";
 import { parseInheritedCliArgs } from "./runner-cli.js";
 import { processPiJsonLine } from "./runner-events.js";
 import {
   type SingleResult,
-  type SubagentDetails,
   emptyUsage,
   getFinalOutput,
   normalizeCompletedResult,
@@ -27,13 +28,9 @@ import {
 const isWindows = process.platform === "win32";
 const SIGKILL_TIMEOUT_MS = 5000;
 const AGENT_END_GRACE_MS = 250;
-const SUBAGENT_DEPTH_ENV = "PI_SUBAGENT_DEPTH";
-const SUBAGENT_MAX_DEPTH_ENV = "PI_SUBAGENT_MAX_DEPTH";
-const SUBAGENT_STACK_ENV = "PI_SUBAGENT_STACK";
-const SUBAGENT_PREVENT_CYCLES_ENV = "PI_SUBAGENT_PREVENT_CYCLES";
 const PI_OFFLINE_ENV = "PI_OFFLINE";
 
-type OnUpdateCallback = (partial: AgentToolResult<SubagentDetails>) => void;
+type OnUpdateCallback = (partial: AgentToolResult) => void;
 
 // ---------------------------------------------------------------------------
 // Process helpers
@@ -76,9 +73,9 @@ function cleanupTempDir(dir: string | null): void {
 const inheritedCliArgs = parseInheritedCliArgs(process.argv);
 
 function buildPiArgs(
-  agent: AgentConfig,
   task: string,
   forkSessionPath: string | null,
+  taskCwd: string | undefined,
 ): string[] {
   const args: string[] = [
     "--mode",
@@ -89,40 +86,22 @@ function buildPiArgs(
   ];
 
   // Fork mode: use the parent's session snapshot (full conversation history)
-  // This ensures the sub-agent sees the same context as the main agent,
-  // preserving the KV cache prefix match.
   if (forkSessionPath) {
     args.push("--session", forkSessionPath);
   }
 
-  const model = agent.model ?? inheritedCliArgs.fallbackModel;
-  if (model) args.push("--model", model);
-
-  const thinking = agent.thinking ?? inheritedCliArgs.fallbackThinking;
-  if (thinking) args.push("--thinking", thinking);
-
   // Always inherit the parent's tools by default.
   // Sub-agents must have the same tool set as the parent to preserve KV cache.
-  // Agent-defined tools are ignored (they're brittle and don't track extension changes).
-  // Never pass --no-tools: sub-agents always get all available tools.
   if (inheritedCliArgs.fallbackTools !== undefined) {
     args.push("--tools", inheritedCliArgs.fallbackTools);
   }
-  // If parent didn't have --tools, don't pass any --tools flag.
-  // Pi will load all available tools (built-in + extensions) by default.
 
   // NO --append-system-prompt! The sub-agent inherits the main agent's
   // system prompt (Pi default + APPEND_SYSTEM.md) automatically.
-  //
-  // The agent's body is included as user message context, not system prompt.
 
-  // Task message with sub-agent marker, preceded by agent body as context
+  // Task message with sub-agent marker
   const taskMessage = `[sub-agent-task] Complete this task:\n${task}`;
-  const userPrompt = agent.systemPrompt.trim()
-    ? `${agent.systemPrompt.trim()}\n\nUser: ${taskMessage}`
-    : `User: ${taskMessage}`;
-
-  args.push(userPrompt);
+  args.push(taskMessage);
   return args;
 }
 
@@ -131,11 +110,9 @@ function buildPiArgs(
 // ---------------------------------------------------------------------------
 
 export interface RunAgentOptions {
-  /** Fallback working directory when the task doesn't specify one. */
+  /** Working directory. */
   cwd: string;
-  /** All available agent configs. */
-  agents: AgentConfig[];
-  /** Name of the agent to run. */
+  /** Freeform name for the sub-agent. */
   agentName: string;
   /** Task description. */
   task: string;
@@ -143,20 +120,12 @@ export interface RunAgentOptions {
   taskCwd?: string;
   /** Serialized parent session snapshot (full conversation in JSONL). */
   forkSessionSnapshotJsonl?: string;
-  /** Current delegation depth of the caller process. */
-  parentDepth: number;
-  /** Delegation stack from the caller process (ancestor agent names). */
-  parentAgentStack: string[];
-  /** Maximum allowed delegation depth to propagate to child processes. */
-  maxDepth: number;
-  /** Whether cycle prevention should be enforced in child processes. */
-  preventCycles: boolean;
   /** Abort signal for cancellation. */
   signal?: AbortSignal;
   /** Streaming update callback. */
   onUpdate?: OnUpdateCallback;
   /** Factory to wrap results into SubagentDetails. */
-  makeDetails: (results: SingleResult[]) => SubagentDetails;
+  makeDetails: (results: SingleResult[]) => { results: SingleResult[] };
   /** Maximum execution time in milliseconds. Default: 120000 (120s). */
   timeout?: number;
   /** Maximum number of assistant turns (LLM calls). Default: 50. */
@@ -171,15 +140,10 @@ export interface RunAgentOptions {
 export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
   const {
     cwd,
-    agents,
     agentName,
     task,
     taskCwd,
     forkSessionSnapshotJsonl,
-    parentDepth,
-    parentAgentStack,
-    maxDepth,
-    preventCycles,
     signal,
     onUpdate,
     makeDetails,
@@ -187,30 +151,14 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
     maxTurns = 50,
   } = opts;
 
-  const agent = agents.find((a) => a.name === agentName);
-  if (!agent) {
-    const available = agents.map((a) => `"${a.name}"`).join(", ") || "none";
-    return {
-      agent: agentName,
-      agentSource: "unknown",
-      task,
-      exitCode: 1,
-      messages: [],
-      stderr: `Unknown agent: "${agentName}". Available agents: ${available}.`,
-      usage: emptyUsage(),
-    };
-  }
-
   if (!forkSessionSnapshotJsonl || !forkSessionSnapshotJsonl.trim()) {
     return {
       agent: agentName,
-      agentSource: agent.source,
       task,
       exitCode: 1,
       messages: [],
       stderr: "Cannot run sub-agent: missing parent session snapshot context.",
       usage: emptyUsage(),
-      model: agent.model,
       stopReason: "error",
       errorMessage: "Cannot run sub-agent: missing parent session snapshot context.",
     };
@@ -218,14 +166,12 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
 
   const result: SingleResult = {
     agent: agentName,
-    agentSource: agent.source,
     task,
     exitCode: -1,
     messages: [],
     stderr: "",
     usage: emptyUsage(),
-    model: agent.model,
-    maxTurns, // Set for runner-events.js maxTurns enforcement
+    maxTurns: maxTurns,
   };
 
   const emitUpdate = () => {
@@ -250,15 +196,12 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
   }
 
   try {
-    const piArgs = buildPiArgs(agent, task, forkSessionTmpPath);
+    const piArgs = buildPiArgs(task, forkSessionTmpPath, taskCwd);
     let wasAborted = false;
     let timedOut = false;
     let exceededMaxTurns = false;
 
     const exitCode = await new Promise<number>((resolve) => {
-      const nextDepth = Math.max(0, Math.floor(parentDepth)) + 1;
-      const propagatedMaxDepth = Math.max(0, Math.floor(maxDepth));
-      const propagatedStack = [...parentAgentStack, agentName];
       const { command, prefixArgs } = resolvePiSpawn();
       const proc = spawn(command, [...prefixArgs, ...piArgs], {
         cwd: taskCwd ?? cwd,
@@ -266,10 +209,6 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
         stdio: ["pipe", "pipe", "pipe"],
         env: {
           ...process.env,
-          [SUBAGENT_DEPTH_ENV]: String(nextDepth),
-          [SUBAGENT_MAX_DEPTH_ENV]: String(propagatedMaxDepth),
-          [SUBAGENT_STACK_ENV]: JSON.stringify(propagatedStack),
-          [SUBAGENT_PREVENT_CYCLES_ENV]: preventCycles ? "1" : "0",
           [PI_OFFLINE_ENV]: "1",
         },
       });
@@ -326,7 +265,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
       };
 
       const flushLine = (line: string) => {
-        if (exceededMaxTurns) return; // Stop processing if max turns exceeded
+        if (exceededMaxTurns) return;
         if (processPiJsonLine(line, result)) emitUpdate();
         maybeFinishFromAgentEnd();
       };
@@ -378,7 +317,6 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
         result.errorMessage = `Sub-agent timed out after ${timeout / 1000}s`;
         result.stderr = `Sub-agent timed out after ${timeout / 1000}s`;
         terminateChild();
-        // Give it a moment to clean up, then force resolve
         setTimeout(() => {
           if (!settled) finish(124);
         }, SIGKILL_TIMEOUT_MS + 500);

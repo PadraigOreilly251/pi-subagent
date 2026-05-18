@@ -1,18 +1,16 @@
 {
   "name": "@mjakl/pi-subagent",
   "version": "1.4.1",
-  "description": "Subagent extension for Pi coding agent. Delegate tasks to specialized agents.",
+  "description": "Subagent extension for Pi coding agent. Delegate tasks to isolated processes with full context inheritance.",
   "type": "module",
   "main": "index.ts",
   "files": [
     "index.ts",
-    "agents.ts",
     "runner.ts",
     "runner-cli.js",
     "runner-events.js",
     "render.ts",
     "types.ts",
-    "agents/*.md",
     "README.md",
     "LICENSE"
   ],
@@ -32,10 +30,10 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/mjakl/pi-subagent.git"
+    "url": "git+https://github.com/BenjaminBilbro/pi-subagent.git"
   },
   "bugs": {
-    "url": "https://github.com/mjakl/pi-subagent/issues"
+    "url": "https://github.com/BenjaminBilbro/pi-subagent/issues"
   },
   "homepage": "https://github.com/mjakl/pi-subagent#readme",
   "publishConfig": {
