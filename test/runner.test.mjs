@@ -119,3 +119,63 @@ test("running results are neither success nor error", () => {
   assert.equal(isResultSuccess(result), false);
   assert.equal(isResultError(result), false);
 });
+
+test("normalizeCompletedResult handles timeout", () => {
+  const result = makeResult({
+    exitCode: 124,
+    timeout: true,
+    stopReason: "timeout",
+    errorMessage: "Sub-agent timed out after 120s",
+    stderr: "Sub-agent timed out after 120s",
+  });
+
+  normalizeCompletedResult(result, false);
+
+  assert.equal(result.exitCode, 124);
+  assert.equal(result.stopReason, "timeout");
+  assert.equal(result.errorMessage, "Sub-agent timed out after 120s");
+  assert.equal(isResultSuccess(result), false);
+  assert.equal(isResultError(result), true);
+});
+
+test("normalizeCompletedResult handles max turns exceeded", () => {
+  const result = makeResult({
+    exitCode: 1,
+    maxTurns: 50,
+    stopReason: "max_turns",
+    errorMessage: "Sub-agent exceeded maximum turns (50)",
+    stderr: "Sub-agent exceeded maximum turns (50)",
+  });
+
+  normalizeCompletedResult(result, false);
+
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.stopReason, "max_turns");
+  assert.equal(result.errorMessage, "Sub-agent exceeded maximum turns (50)");
+  assert.equal(isResultSuccess(result), false);
+  assert.equal(isResultError(result), true);
+});
+
+test("isResultSuccess returns false for timeout even with semantic completion", () => {
+  const result = makeResult({
+    exitCode: 124,
+    timeout: true,
+    stopReason: "timeout",
+    sawAgentEnd: true,
+    messages: [{ role: "assistant", content: [{ type: "text", text: "Done" }] }],
+  });
+
+  assert.equal(isResultSuccess(result), false);
+});
+
+test("isResultSuccess returns false for max_turns even with semantic completion", () => {
+  const result = makeResult({
+    exitCode: 1,
+    maxTurns: 50,
+    stopReason: "max_turns",
+    sawAgentEnd: true,
+    messages: [{ role: "assistant", content: [{ type: "text", text: "Done" }] }],
+  });
+
+  assert.equal(isResultSuccess(result), false);
+});

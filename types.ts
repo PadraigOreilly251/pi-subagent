@@ -1,15 +1,12 @@
 /**
  * Shared type definitions for the subagent extension.
+ *
+ * Phase 1: Single sub-agent only. Fork mode (full context inheritance).
+ * No parallel execution. No spawn mode.
  */
 
 import type { Message } from "@mariozechner/pi-ai";
 import { getFinalAssistantText } from "./runner-events.js";
-
-/** Context mode for delegated runs. */
-export type DelegationMode = "spawn" | "fork";
-
-/** Default context mode for delegated runs. */
-export const DEFAULT_DELEGATION_MODE: DelegationMode = "spawn";
 
 /** Aggregated token usage from a subagent run. */
 export interface UsageStats {
@@ -35,12 +32,12 @@ export interface SingleResult {
 	stopReason?: string;
 	errorMessage?: string;
 	sawAgentEnd?: boolean;
+	timeout?: boolean; // true if killed due to timeout
+	maxTurns?: number; // max turns limit (set by runner for enforcement)
 }
 
 /** Metadata attached to every tool result for rendering. */
 export interface SubagentDetails {
-	mode: "single" | "parallel";
-	delegationMode: DelegationMode;
 	projectAgentsDir: string | null;
 	results: SingleResult[];
 }
@@ -82,6 +79,8 @@ export function hasSemanticCompletion(r: Pick<SingleResult, "messages" | "sawAge
 /** Whether a result should be treated as successful by the wrapper/UI. */
 export function isResultSuccess(r: SingleResult): boolean {
 	if (r.exitCode === -1) return false;
+	// Explicitly reject timeout and max_turns even with semantic completion
+	if (r.stopReason === "timeout" || r.stopReason === "max_turns") return false;
 	if (hasSemanticCompletion(r)) return true;
 	return r.exitCode === 0 && r.stopReason !== "error" && r.stopReason !== "aborted";
 }
@@ -92,7 +91,7 @@ export function isResultError(r: SingleResult): boolean {
 	return !isResultSuccess(r);
 }
 
-/** Reconcile process exit status with semantic completion observed from Pi's event stream. */
+//** Reconcile process exit status with semantic completion observed from Pi's event stream. */
 export function normalizeCompletedResult(result: SingleResult, wasAborted: boolean): SingleResult {
 	const hasSemanticSuccess = hasSemanticCompletion(result);
 
@@ -109,6 +108,28 @@ export function normalizeCompletedResult(result: SingleResult, wasAborted: boole
 			result.errorMessage = "Subagent was aborted.";
 			if (!result.stderr.trim()) result.stderr = "Subagent was aborted.";
 		}
+		return result;
+	}
+
+	// Handle timeout (runner already set exitCode, stopReason, errorMessage)
+	if (result.timeout) {
+		result.exitCode = 124;
+		result.stopReason = "timeout";
+		if (!result.errorMessage && result.stderr.trim()) {
+			result.errorMessage = result.stderr.trim();
+		}
+		if (!result.stderr.trim()) result.stderr = result.errorMessage || "Sub-agent timed out.";
+		return result;
+	}
+
+	// Handle max turns exceeded (runner already set exitCode, stopReason, errorMessage)
+	if (result.maxTurns) {
+		result.exitCode = 1;
+		result.stopReason = "max_turns";
+		if (!result.errorMessage && result.stderr.trim()) {
+			result.errorMessage = result.stderr.trim();
+		}
+		if (!result.stderr.trim()) result.stderr = result.errorMessage || "Sub-agent exceeded maximum turns.";
 		return result;
 	}
 

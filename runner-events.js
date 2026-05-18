@@ -78,6 +78,14 @@ function addAssistantMessages(result, messages) {
 export function processPiEvent(event, result) {
   if (!event || typeof event !== "object") return false;
 
+  // Check max turns limit before processing new events
+  if (result.maxTurns && result.usage.turns >= result.maxTurns) {
+    result.stopReason = "max_turns";
+    result.errorMessage = `Sub-agent exceeded maximum turns (${result.maxTurns})`;
+    result.stderr = `Sub-agent exceeded maximum turns (${result.maxTurns})`;
+    return false;
+  }
+
   switch (event.type) {
     case "message_end":
       return addAssistantMessage(result, event.message);

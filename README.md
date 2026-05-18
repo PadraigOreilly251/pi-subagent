@@ -1,18 +1,16 @@
-# Pi Subagent
+# Pi Subagent (Phase 1)
 
-**Delegate tasks to specialized subagents with configurable context modes (`spawn` / `fork`).**
+**Delegate tasks to specialized subagents with full context inheritance.**
 
-There are many subagent extensions for pi, this one is mine.
+Phase 1 focuses on **KV cache stability** — sub-agents inherit the exact same system prompt and conversation history as the main agent, preserving the KV cache prefix match for minimal recomputation.
 
 ## Why Pi Subagent
 
-**Specialization** — Use tailored agents for specific tasks like refactoring, documentation, or research.
+**KV Cache Preservation** — Sub-agents inherit the full session context without modifying the system prompt, so llama.cpp can reuse the existing KV cache.
 
-**Context Control** — Choose `spawn` (fresh context) or `fork` (inherit current session context), depending on the task.
+**Full Context** — Sub-agents see the complete conversation history, not just a task description.
 
-**Parallel Execution** — Run multiple agents at once.
-
-**A Simpler Fork** — This extension intentionally trims features from other implementations (like chaining and scope selectors) to keep the surface area small and predictable. If you want the minimal, “just delegate” experience, this is it.
+**Single Delegation** — Clean, predictable single sub-agent execution (no parallel complexity).
 
 ## Install
 
@@ -92,30 +90,6 @@ pi --subagent-max-depth 0
 pi --subagent-max-depth 3 --no-subagent-prevent-cycles
 ```
 
-### Context Mode (`spawn` vs `fork`)
-
-`subagent` supports a top-level `mode` switch:
-
-- `spawn` (default) — Child receives only the task string (`Task: ...`). Best for isolated, reproducible work; typically lower token/cost and less context leakage.
-- `fork` — Child receives a forked snapshot of the current session context **plus** the task string. Best for follow-up work that depends on prior context; typically higher token/cost and may include sensitive context.
-
-Quick rule of thumb:
-
-- Start with `spawn` for one-off tasks.
-- Use `fork` when the delegated task depends on the current session's prior discussion, reads, or decisions.
-
-Examples:
-
-```json
-{ "agent": "writer", "task": "Document the API", "mode": "spawn" }
-```
-
-```json
-{ "agent": "review", "task": "Double-check this migration", "mode": "fork" }
-```
-
-If omitted, mode defaults to `spawn`.
-
 ### Subagent Definitions
 
 Subagents are defined as Markdown files with YAML frontmatter.
@@ -155,7 +129,7 @@ Notes:
 - `model` accepts `provider/model` syntax — this is a Pi feature. Use it when multiple providers offer the same model ID.
 - `thinking` uses the same values as Pi's `--thinking` flag; it's recommended to set it explicitly since thinking support varies by model.
 - `tools` only controls built-in tools. Extension tools remain available unless extensions are disabled.
-- The Markdown body below the frontmatter becomes the agent's system prompt and is **appended** to Pi's default system prompt (it does **not** replace it).
+- The Markdown body below the frontmatter becomes the agent's system prompt and is **appended as context** (not system prompt) to the sub-agent's user message.
 
 ### Writing a Good Agent File
 
@@ -189,40 +163,22 @@ Each subagent always runs in a **separate `pi` process**:
 - ✅ Started with `PI_OFFLINE=1` to skip startup network operations and reduce spawn latency
 - ✅ Inherits relevant parent CLI configuration such as extensions, provider/theme/skill flags, resolves inherited relative resource paths against the parent cwd, and reuses parent `--model` / `--thinking` / `--tools` values when the agent file does not override them
 
-What it can see depends on `mode`:
-
-- `spawn` (default)
-  - ✅ Receives: subagent system prompt + `Task: ...`
-  - ❌ Does **not** receive parent session history
-- `fork`
-  - ✅ Receives: forked snapshot of current parent session context + `Task: ...`
-
 ### What Gets Sent to Subagents
 
-#### `spawn` mode (default)
-
-`subagent({ agent: "writer", task: "Document the API" })` sends:
+The sub-agent receives:
 
 ```
-[System Prompt from ~/.pi/agent/agents/writer.md]
+[Forked snapshot of current session context — identical to parent]
+[Agent body from agent file — appended as user message context]
 
-User: Task: Document the API
+User: [sub-agent-task] Complete this task:
+{task description}
 ```
 
-No parent conversation history is included. In `spawn`, include all required context in `task`.
-
-#### `fork` mode
-
-`subagent({ agent: "writer", task: "Document the API", mode: "fork" })` sends:
-
-```
-[Forked snapshot of current session context]
-[System Prompt from ~/.pi/agent/agents/writer.md]
-
-User: Task: Document the API
-```
-
-Note: `fork` copies session context, not transient runtime-only prompt mutations from the parent process.
+**Key points:**
+- The sub-agent inherits the **exact same system prompt** as the main agent (Pi default + `APPEND_SYSTEM.md`)
+- The agent body from the agent file is included as user message context, NOT as system prompt
+- This preserves the KV cache prefix match — llama.cpp can reuse the existing cache
 
 ### What Comes Back to the Main Agent
 
@@ -236,27 +192,12 @@ Note: `fork` copies session context, not transient runtime-only prompt mutations
 
 **Key point:** The main agent receives **only the final assistant text** from each subagent. Not the tool calls, not the reasoning, not the intermediate steps. This prevents context pollution while still giving you the results.
 
-### Parallel Mode Behavior
-
-When running multiple agents in parallel:
-
-- All subagents start simultaneously (up to 4 concurrent)
-- The top-level `mode` applies to all tasks in that call
-- Main agent receives a combined result after all finish:
-
-```
-Parallel: 3/3 succeeded
-
-[writer] completed: Full output text here...
-[tester] completed: Full output text here...
-[reviewer] completed: Full output text here...
-```
-
 ## Features
 
 - **Auto-Discovery** — Agents are found at startup and their descriptions are injected into the main agent's system prompt.
-- **Context Mode Switch** — `spawn` (fresh context) and `fork` (session snapshot + task) per call.
+- **Full Context Inheritance** — Sub-agents receive the complete session context, preserving KV cache efficiency.
 - **Depth + Cycle Guards** — Depth limiting and ancestry-cycle checks prevent runaway recursive delegation by default.
+- **Timeout & Max Turns** — Configurable safeguards against runaway sub-agents (default: 120s timeout, 50 max turns).
 - **Streaming Updates** — Watch subagent progress in real-time as tool calls and outputs stream in.
 - **Rich TUI Rendering** — Collapsed/expanded views with usage stats, tool call previews, and markdown output.
 - **Security Confirmation** — Project-local agents require explicit user approval before execution.
@@ -264,13 +205,51 @@ Parallel: 3/3 succeeded
 ## Project Structure
 
 ```
-index.ts       — Extension entry point: lifecycle hooks, tool registration, mode orchestration
+index.ts       — Extension entry point: lifecycle hooks, tool registration, execution
 agents.ts      — Agent discovery: reads and parses .md files from the active Pi config dir and project directories
+runner.ts      — Process runner: starts `pi` subprocesses with full context inheritance and streams results
 runner-cli.js  — Parent CLI inheritance: parses and normalizes flags forwarded to child processes
-runner.ts      — Process runner: starts `pi` subprocesses in spawn/fork context modes and streams JSON events
+runner-events.js — Event parser: processes Pi JSON mode events, enforces maxTurns limits
 render.ts      — TUI rendering: renderCall and renderResult for the subagent tool
 types.ts       — Shared types and pure helper functions
 ```
+
+ Phase 1 Implementation Complete                                                                                                                                                                                                                                                                           
+                                                                                                                                                                                                                                                                                                           
+ ### Changes Made                                                                                                                                                                                                                                                                                          
+                                                                                                                                                                                                                                                                                                           
+ ┌─────────────────────────────┬─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐ 
+ │ File                        │ What Changed                                                                                                                                                                                                                                                            │ 
+ ├─────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤ 
+ │ types.ts                    │ Removed DelegationMode, DEFAULT_DELEGATION_MODE, SubagentDetails.mode. Added timeout/maxTurns to SingleResult. Updated isResultSuccess to reject timeout/max_turns. Updated normalizeCompletedResult to handle timeout/max_turns without overwriting existing           │ 
+ │                             │ errorMessage.                                                                                                                                                                                                                                                           │ 
+ ├─────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤ 
+ │ runner-events.js            │ Added maxTurns enforcement — stops processing events when usage.turns >= maxTurns.                                                                                                                                                                                      │ 
+ ├─────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤ 
+ │ runner.ts                   │ Major rewrite: removed parallel helpers (mapConcurrent), removed --append-system-prompt, removed forkSession per-agent temp files. Added timeout timer (SIGTERM → SIGKILL). Added maxTurns passed to result. Agent body included as user message context with           │ 
+ │                             │ [sub-agent-task] tag.                                                                                                                                                                                                                                                   │ 
+ ├─────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤ 
+ │ render.ts                   │ Removed delegation mode display, removed parallel rendering. Simplified to single-mode only. Added status icons for timeout (⏰) and maxTurns (🔄).                                                                                                                     │ 
+ ├─────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤ 
+ │ index.ts                    │ Major rewrite: removed mode param, removed tasks array/parallel mode, removed spawn support. Always uses fork mode (full context). Added timeout/maxTurns params. Removed system prompt injection for sub-agents.                                                       │ 
+ ├─────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤ 
+ │ README.md                   │ Updated to reflect Phase 1: single sub-agent, full context inheritance, no parallel, KV cache preservation focus.                                                                                                                                                       │ 
+ ├─────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤ 
+ │ test/runner.test.mjs        │ Added 4 new tests for timeout/maxTurns handling.                                                                                                                                                                                                                        │ 
+ ├─────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤ 
+ │ test/runner-events.test.mjs │ Added maxTurns enforcement test.                                                                                                                                                                                                                                        │ 
+ └─────────────────────────────┴─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘ 
+                                                                                                                                                                                                                                                                                                           
+ ### Key Design Decisions Implemented                                                                                                                                                                                                                                                                      
+                                                                                                                                                                                                                                                                                                           
+ 1. Same system prompt — Sub-agents inherit Pi's default + APPEND_SYSTEM.md automatically (no --append-system-prompt)                                                                                                                                                                                      
+ 2. Agent body as user context — Agent file body prepended to task in user message, not system prompt                                                                                                                                                                                                      
+ 3. [sub-agent-task] tag — Clear delimiter for sub-agents to identify their role                                                                                                                                                                                                                           
+ 4. No parallel execution — Single sub-agent only, preserving KV cache logic                                                                                                                                                                                                                               
+ 5. Timeout (120s default) — SIGTERM → SIGKILL after 5s grace period                                                                                                                                                                                                                                       
+ 6. Max turns (50 default) — Enforced in event processing stream                                                                                                                                                                                                                                           
+                                                                                                                                                                                                                                                                                                           
+ ### Test Results: 20/20 passing  
 
 ## Attribution
 

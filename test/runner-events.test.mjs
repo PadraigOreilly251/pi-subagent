@@ -110,3 +110,39 @@ test("stderr remains a fallback only for error results", () => {
   failedResult.stderr = "warning on stderr";
   assert.equal(getResultSummaryText(failedResult), "warning on stderr");
 });
+
+test("maxTurns enforcement stops processing when limit is reached", () => {
+  // Use unique messages to avoid deduplication
+  const makeMsg = (i) => ({
+    role: "assistant",
+    content: [{ type: "text", text: `Turn message ${i}` }],
+    model: "test-model",
+    usage: {
+      input: 1,
+      output: 2,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 3,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+    timestamp: i,
+  });
+
+  const result = makeResult();
+  result.maxTurns = 3;
+
+  // Process 3 messages (reaching the limit)
+  processPiEvent({ type: "message_end", message: makeMsg(1) }, result);
+  processPiEvent({ type: "message_end", message: makeMsg(2) }, result);
+  processPiEvent({ type: "message_end", message: makeMsg(3) }, result);
+
+  assert.equal(result.messages.length, 3);
+  assert.equal(result.usage.turns, 3);
+
+  // 4th message should be blocked by maxTurns
+  const blocked = processPiEvent({ type: "message_end", message: makeMsg(4) }, result);
+  assert.equal(blocked, false);
+  assert.equal(result.messages.length, 3);
+  assert.equal(result.stopReason, "max_turns");
+  assert.equal(result.errorMessage, "Sub-agent exceeded maximum turns (3)");
+});

@@ -1,7 +1,11 @@
 /**
- * Subagent process runner.
+ * Subagent process runner (Phase 1).
  *
- * Spawns isolated `pi` processes and streams results back via callbacks.
+ * Spawns isolated `pi` subprocesses with full context inheritance.
+ * Sub-agents inherit the exact same system prompt as the main agent
+ * (no --append-system-prompt). Task is delivered as a user message.
+ *
+ * No parallel execution. No spawn mode. Only fork (full context).
  */
 
 import { spawn } from "node:child_process";
@@ -13,7 +17,6 @@ import type { AgentConfig } from "./agents.js";
 import { parseInheritedCliArgs } from "./runner-cli.js";
 import { processPiJsonLine } from "./runner-events.js";
 import {
-  type DelegationMode,
   type SingleResult,
   type SubagentDetails,
   emptyUsage,
@@ -36,10 +39,6 @@ type OnUpdateCallback = (partial: AgentToolResult<SubagentDetails>) => void;
 // Process helpers
 // ---------------------------------------------------------------------------
 
-/**
- * Derive the spawn command from the current process context so child invocations
- * work on Unix and Windows without going through a shell wrapper.
- */
 function resolvePiSpawn(): { command: string; prefixArgs: string[] } {
   const isNode = /[\\/]node(?:\.exe)?$/i.test(process.execPath);
   if (isNode && process.argv[1]) {
@@ -52,24 +51,11 @@ function resolvePiSpawn(): { command: string; prefixArgs: string[] } {
 // Temp file helpers
 // ---------------------------------------------------------------------------
 
-function writePromptToTempFile(
-  agentName: string,
-  prompt: string,
-): { dir: string; filePath: string } {
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-"));
-  const safeName = agentName.replace(/[^\w.-]+/g, "_");
-  const filePath = path.join(tmpDir, `prompt-${safeName}.md`);
-  fs.writeFileSync(filePath, prompt, { encoding: "utf-8", mode: 0o600 });
-  return { dir: tmpDir, filePath };
-}
-
 function writeForkSessionToTempFile(
-  agentName: string,
   sessionJsonl: string,
 ): { dir: string; filePath: string } {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-"));
-  const safeName = agentName.replace(/[^\w.-]+/g, "_");
-  const filePath = path.join(tmpDir, `fork-${safeName}.jsonl`);
+  const filePath = path.join(tmpDir, `session.jsonl`);
   fs.writeFileSync(filePath, sessionJsonl, { encoding: "utf-8", mode: 0o600 });
   return { dir: tmpDir, filePath };
 }
@@ -91,9 +77,7 @@ const inheritedCliArgs = parseInheritedCliArgs(process.argv);
 
 function buildPiArgs(
   agent: AgentConfig,
-  systemPromptPath: string | null,
   task: string,
-  delegationMode: DelegationMode,
   forkSessionPath: string | null,
 ): string[] {
   const args: string[] = [
@@ -104,9 +88,10 @@ function buildPiArgs(
     "-p",
   ];
 
-  if (delegationMode === "spawn") {
-    args.push("--no-session");
-  } else if (forkSessionPath) {
+  // Fork mode: use the parent's session snapshot (full conversation history)
+  // This ensures the sub-agent sees the same context as the main agent,
+  // preserving the KV cache prefix match.
+  if (forkSessionPath) {
     args.push("--session", forkSessionPath);
   }
 
@@ -126,8 +111,18 @@ function buildPiArgs(
     }
   }
 
-  if (systemPromptPath) args.push("--append-system-prompt", systemPromptPath);
-  args.push(`Task: ${task}`);
+  // NO --append-system-prompt! The sub-agent inherits the main agent's
+  // system prompt (Pi default + APPEND_SYSTEM.md) automatically.
+  //
+  // The agent's body is included as user message context, not system prompt.
+
+  // Task message with sub-agent marker, preceded by agent body as context
+  const taskMessage = `[sub-agent-task] Complete this task:\n${task}`;
+  const userPrompt = agent.systemPrompt.trim()
+    ? `${agent.systemPrompt.trim()}\n\nUser: ${taskMessage}`
+    : `User: ${taskMessage}`;
+
+  args.push(userPrompt);
   return args;
 }
 
@@ -146,9 +141,7 @@ export interface RunAgentOptions {
   task: string;
   /** Optional override working directory. */
   taskCwd?: string;
-  /** Context mode: spawn (fresh) or fork (session snapshot + task). */
-  delegationMode: DelegationMode;
-  /** Serialized parent session snapshot used when delegationMode is "fork". */
+  /** Serialized parent session snapshot (full conversation in JSONL). */
   forkSessionSnapshotJsonl?: string;
   /** Current delegation depth of the caller process. */
   parentDepth: number;
@@ -164,6 +157,10 @@ export interface RunAgentOptions {
   onUpdate?: OnUpdateCallback;
   /** Factory to wrap results into SubagentDetails. */
   makeDetails: (results: SingleResult[]) => SubagentDetails;
+  /** Maximum execution time in milliseconds. Default: 120000 (120s). */
+  timeout?: number;
+  /** Maximum number of assistant turns (LLM calls). Default: 50. */
+  maxTurns?: number;
 }
 
 /**
@@ -178,7 +175,6 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
     agentName,
     task,
     taskCwd,
-    delegationMode,
     forkSessionSnapshotJsonl,
     parentDepth,
     parentAgentStack,
@@ -187,6 +183,8 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
     signal,
     onUpdate,
     makeDetails,
+    timeout = 120_000,
+    maxTurns = 50,
   } = opts;
 
   const agent = agents.find((a) => a.name === agentName);
@@ -203,23 +201,18 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
     };
   }
 
-  if (
-    delegationMode === "fork" &&
-    (!forkSessionSnapshotJsonl || !forkSessionSnapshotJsonl.trim())
-  ) {
+  if (!forkSessionSnapshotJsonl || !forkSessionSnapshotJsonl.trim()) {
     return {
       agent: agentName,
       agentSource: agent.source,
       task,
       exitCode: 1,
       messages: [],
-      stderr:
-        "Cannot run in fork mode: missing parent session snapshot context.",
+      stderr: "Cannot run sub-agent: missing parent session snapshot context.",
       usage: emptyUsage(),
       model: agent.model,
       stopReason: "error",
-      errorMessage:
-        "Cannot run in fork mode: missing parent session snapshot context.",
+      errorMessage: "Cannot run sub-agent: missing parent session snapshot context.",
     };
   }
 
@@ -232,6 +225,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
     stderr: "",
     usage: emptyUsage(),
     model: agent.model,
+    maxTurns, // Set for runner-events.js maxTurns enforcement
   };
 
   const emitUpdate = () => {
@@ -246,33 +240,20 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
     });
   };
 
-  // Write system prompt to temp file if needed
-  let promptTmpDir: string | null = null;
-  let promptTmpPath: string | null = null;
-  if (agent.systemPrompt.trim()) {
-    const tmp = writePromptToTempFile(agent.name, agent.systemPrompt);
-    promptTmpDir = tmp.dir;
-    promptTmpPath = tmp.filePath;
-  }
-
-  // Write forked session snapshot if needed
+  // Write forked session snapshot to temp file
   let forkSessionTmpDir: string | null = null;
   let forkSessionTmpPath: string | null = null;
-  if (delegationMode === "fork" && forkSessionSnapshotJsonl) {
-    const tmp = writeForkSessionToTempFile(agent.name, forkSessionSnapshotJsonl);
+  if (forkSessionSnapshotJsonl) {
+    const tmp = writeForkSessionToTempFile(forkSessionSnapshotJsonl);
     forkSessionTmpDir = tmp.dir;
     forkSessionTmpPath = tmp.filePath;
   }
 
   try {
-    const piArgs = buildPiArgs(
-      agent,
-      promptTmpPath,
-      task,
-      delegationMode,
-      forkSessionTmpPath,
-    );
+    const piArgs = buildPiArgs(agent, task, forkSessionTmpPath);
     let wasAborted = false;
+    let timedOut = false;
+    let exceededMaxTurns = false;
 
     const exitCode = await new Promise<number>((resolve) => {
       const nextDepth = Math.max(0, Math.floor(parentDepth)) + 1;
@@ -303,11 +284,16 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
       let settled = false;
       let abortHandler: (() => void) | undefined;
       let semanticCompletionTimer: NodeJS.Timeout | undefined;
+      let timeoutTimer: NodeJS.Timeout | undefined;
 
-      const clearSemanticCompletionTimer = () => {
+      const clearTimers = () => {
         if (semanticCompletionTimer) {
           clearTimeout(semanticCompletionTimer);
           semanticCompletionTimer = undefined;
+        }
+        if (timeoutTimer) {
+          clearTimeout(timeoutTimer);
+          timeoutTimer = undefined;
         }
       };
 
@@ -332,7 +318,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
       const finish = (code: number) => {
         if (settled) return;
         settled = true;
-        clearSemanticCompletionTimer();
+        clearTimers();
         if (signal && abortHandler) {
           signal.removeEventListener("abort", abortHandler);
         }
@@ -340,6 +326,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
       };
 
       const flushLine = (line: string) => {
+        if (exceededMaxTurns) return; // Stop processing if max turns exceeded
         if (processPiJsonLine(line, result)) emitUpdate();
         maybeFinishFromAgentEnd();
       };
@@ -352,7 +339,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
 
       const maybeFinishFromAgentEnd = () => {
         if (!result.sawAgentEnd || didClose || settled) return;
-        clearSemanticCompletionTimer();
+        clearTimers();
         semanticCompletionTimer = setTimeout(() => {
           if (didClose || settled || !result.sawAgentEnd) return;
           if (buffer.trim()) {
@@ -381,14 +368,32 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
       proc.stdout.on("data", onStdoutData);
       proc.stderr.on("data", onStderrData);
 
+      // Timeout handling
+      timeoutTimer = setTimeout(() => {
+        if (didClose || settled) return;
+        timedOut = true;
+        result.timeout = true;
+        result.exitCode = 124;
+        result.stopReason = "timeout";
+        result.errorMessage = `Sub-agent timed out after ${timeout / 1000}s`;
+        result.stderr = `Sub-agent timed out after ${timeout / 1000}s`;
+        terminateChild();
+        // Give it a moment to clean up, then force resolve
+        setTimeout(() => {
+          if (!settled) finish(124);
+        }, SIGKILL_TIMEOUT_MS + 500);
+      }, timeout);
+
       proc.on("close", (code) => {
         didClose = true;
+        clearTimers();
         if (buffer.trim()) flushBufferedLines(buffer);
         finish(code ?? 0);
       });
 
       proc.on("error", (err) => {
         if (!result.stderr.trim()) result.stderr = err.message;
+        clearTimers();
         finish(1);
       });
 
@@ -397,6 +402,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
         abortHandler = () => {
           if (didClose || settled) return;
           wasAborted = true;
+          clearTimers();
           terminateChild();
         };
         if (signal.aborted) abortHandler();
@@ -407,36 +413,6 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
     result.exitCode = exitCode;
     return normalizeCompletedResult(result, wasAborted);
   } finally {
-    cleanupTempDir(promptTmpDir);
     cleanupTempDir(forkSessionTmpDir);
   }
-}
-
-// ---------------------------------------------------------------------------
-// Concurrency helper
-// ---------------------------------------------------------------------------
-
-/**
- * Map over items with a bounded number of concurrent workers.
- */
-export async function mapConcurrent<TIn, TOut>(
-  items: TIn[],
-  concurrency: number,
-  fn: (item: TIn, index: number) => Promise<TOut>,
-): Promise<TOut[]> {
-  if (items.length === 0) return [];
-  const limit = Math.max(1, Math.min(concurrency, items.length));
-  const results: TOut[] = new Array(items.length);
-  let nextIndex = 0;
-
-  const worker = async () => {
-    while (true) {
-      const i = nextIndex++;
-      if (i >= items.length) return;
-      results[i] = await fn(items[i], i);
-    }
-  };
-
-  await Promise.all(Array.from({ length: limit }, () => worker()));
-  return results;
 }
