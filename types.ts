@@ -78,22 +78,32 @@ export function hasSemanticCompletion(r: Pick<SingleResult, "messages" | "sawAge
 
 /** Whether a result should be treated as successful by the wrapper/UI. */
 export function isResultSuccess(r: SingleResult): boolean {
+	const sc = hasSemanticCompletion(r);
+	const exitNotMinus1 = r.exitCode !== -1;
+	const notTimeoutOrMaxTurns = r.stopReason !== "timeout" && r.stopReason !== "max_turns";
+	const exitCodeZero = r.exitCode === 0;
+	const notErrorAborted = r.stopReason !== "error" && r.stopReason !== "aborted";
+	console.error(`[DEBUG isResultSuccess] exitCode=${r.exitCode} stopReason=${r.stopReason} errorMessage=${r.errorMessage} sawAgentEnd=${r.sawAgentEnd} messages.length=${r.messages.length} sc=${sc} exitNotMinus1=${exitNotMinus1} notTimeoutOrMaxTurns=${notTimeoutOrMaxTurns} exitCodeZero=${exitCodeZero} notErrorAborted=${notErrorAborted}`);
 	if (r.exitCode === -1) return false;
 	// Explicitly reject timeout and max_turns even with semantic completion
 	if (r.stopReason === "timeout" || r.stopReason === "max_turns") return false;
-	if (hasSemanticCompletion(r)) return true;
+	if (sc) return true;
 	return r.exitCode === 0 && r.stopReason !== "error" && r.stopReason !== "aborted";
 }
 
 /** Whether a result represents an error. */
 export function isResultError(r: SingleResult): boolean {
+	const exitNotMinus1 = r.exitCode !== -1;
+	const success = isResultSuccess(r);
+	console.error(`[DEBUG isResultError] exitNotMinus1=${exitNotMinus1} success=${success} => ${!success}`);
 	if (r.exitCode === -1) return false;
-	return !isResultSuccess(r);
+	return !success;
 }
 
 //** Reconcile process exit status with semantic completion observed from Pi's event stream. */
 export function normalizeCompletedResult(result: SingleResult, wasAborted: boolean): SingleResult {
 	const hasSemanticSuccess = hasSemanticCompletion(result);
+	console.error(`[DEBUG normalizeCompletedResult] BEFORE: exitCode=${result.exitCode} stopReason=${result.stopReason} sawAgentEnd=${result.sawAgentEnd} messages.length=${result.messages.length} hasSemanticSuccess=${hasSemanticSuccess} wasAborted=${wasAborted} timeout=${result.timeout} maxTurns=${result.maxTurns} stderr=${result.stderr.substring(0,100)}`);
 
 	if (wasAborted) {
 		if (hasSemanticSuccess) {
@@ -148,6 +158,7 @@ export function normalizeCompletedResult(result: SingleResult, wasAborted: boole
 		}
 	}
 
+	console.error(`[DEBUG normalizeCompletedResult] AFTER: exitCode=${result.exitCode} stopReason=${result.stopReason} errorMessage=${result.errorMessage}`);
 	return result;
 }
 
