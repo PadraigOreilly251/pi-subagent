@@ -57,7 +57,7 @@ Clone this repository to your Pi extensions directory:
 
 ```bash
 cd ~/.pi/agent/extensions
-git clone https://github.com/mjakl/pi-subagent.git
+git clone https://github.com/BenjaminBilbro/pi-subagent.git
 cd pi-subagent
 npm install
 ```
