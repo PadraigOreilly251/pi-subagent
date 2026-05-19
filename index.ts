@@ -29,9 +29,6 @@ import {
 // Constants
 // ---------------------------------------------------------------------------
 
-const DEFAULT_TIMEOUT_MS = 120_000; // 120 seconds
-const DEFAULT_MAX_TURNS = 50;
-
 /**
  * Constant sub-agent instructions injected into the system prompt.
  *
@@ -41,17 +38,21 @@ const DEFAULT_MAX_TURNS = 50;
 const SUBAGENT_INSTRUCTIONS = `
 ## Sub-Agent Tools/Extension
 
-You can delegate tasks to sub-agents running in isolated processes using the \`subagent\` tool.
+Since we are running all our LLMs locally, we have to use a modified version of sub-agents. This means that you may switch between main agent and sub agent mode at any point during the session. 
 
-### How Sub-Agents Work
+You will know sub-agent mode is active when you see a user message that follows this format:
 
-- **Full context inheritance** — Sub-agents receive your complete conversation history and the same system prompt.
-- **Isolated processes** — Each sub-agent runs in its own \`pi\` process with \`PI_OFFLINE=1\`.
-- **No recursion** — Sub-agents are explicitly forbidden from spawning further sub-agents. This is enforced at the runner level.
-- **Same model** — Sub-agents use the same model as the main agent.
-- **Results** — You receive only the final assistant text from each sub-agent, not intermediate tool calls or reasoning steps.
+\`\`\`
+**[BEGIN SUB AGENT MODE]**: <prompt and task will go here>
+\`\`\`
 
-### When to Use Sub-Agents
+Once you see that then you will be operating in sub-agent mode, where you have an assigned task and should work to complete it. You will not be able to spawn any sub agents while operating in sub agent mode.
+Your primary goal is to accomplish the task and report back to the main agent.
+
+Another way to tell if you are in sub-agent mode is to look at the most recent tool call. You will see the sub-agent tool call followed by an empty tool result "No result provided". You ARE the tool result actively running in sub-agent mode.
+This means your final response will be the tool_result.
+
+### When to Use a Sub-Agent
 
 Use sub-agents when you need to:
 - Do heavy research across many files without polluting your context
@@ -59,27 +60,20 @@ Use sub-agents when you need to:
 - Offload specialized work while you continue other tasks
 - Preserve context efficiency by keeping only summaries in your context
 
+A sub-agent will have FULL context for all tool calls/results and message history up until the point you spawn it, meaning it will know exactly what you know. Keep this in mind while defining a full task statement.
+
 ### Calling the Subagent Tool
 
 \`\`\`
 subagent({
   name: "researcher",     // Freeform name (human-like, for your reference)
   task: "Research the latest about quantum computing",
-  timeout: 180,           // Optional: max seconds (default: 120)
+  timeout: 180,           // Optional: max seconds (default: 600)
   maxTurns: 80,           // Optional: max LLM turns (default: 50)
   cwd: "/path/to/dir"     // Optional: working directory
 })
 \`\`\`
 
-### Sub-Agent Mode
-
-When you spawn a sub-agent, it will see this marker when operating in sub-agent mode:
-
-\`\`\`
-**[BEGIN SUB AGENT MODE]**: <prompt and task will go here>
-\`\`\`
-
-If you are in sub-agent mode, you are explicitly forbidden from spawning more sub-agents.
 
 ### Best Practices
 
@@ -95,7 +89,7 @@ If you are in sub-agent mode, you are explicitly forbidden from spawning more su
 
 const SubagentParams = Type.Object({
 	name: Type.String({
-		description: "A human-like name for the sub-agent (e.g., 'researcher', 'analyst'). Freeform, no config lookup.",
+		description: "A human-like name for the sub-agent (e.g., 'researcher', 'analyst', or even something like 'Albert', 'Isaac', 'Ben' for non-focused tasks). Freeform, no config lookup.",
 	}),
 	task: Type.String({
 		description:
@@ -103,8 +97,8 @@ const SubagentParams = Type.Object({
 	}),
 	timeout: Type.Optional(
 		Type.Number({
-			description: "Maximum execution time in seconds. Default: 120.",
-			default: 120,
+			description: "Maximum execution time in seconds. Default: 600.",
+			default: 600,
 		}),
 	),
 	maxTurns: Type.Optional(
@@ -116,7 +110,7 @@ const SubagentParams = Type.Object({
 	),
 	cwd: Type.Optional(
 		Type.String({
-			description: "Working directory for the agent process.",
+			description: "Working directory for the agent process. Will default to your CWD.",
 		}),
 	),
 });
