@@ -4,6 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  getAllAssistantText,
   getFinalAssistantText,
   getResultSummaryText,
   processPiEvent,
@@ -109,6 +110,46 @@ test("stderr remains a fallback only for error results", () => {
   failedResult.exitCode = 1;
   failedResult.stderr = "warning on stderr";
   assert.equal(getResultSummaryText(failedResult), "warning on stderr");
+});
+
+test("getAllAssistantText collects text from all assistant messages", () => {
+  const messages = [
+    {
+      role: "assistant",
+      content: [{ type: "text", text: "First message content." }],
+      timestamp: 1,
+    },
+    {
+      role: "assistant",
+      content: [{ type: "text", text: "Second message content." }],
+      timestamp: 2,
+    },
+    { role: "user", content: [{ type: "text", text: "User message" }], timestamp: 3 },
+    {
+      role: "assistant",
+      content: [{ type: "text", text: "Third message content." }],
+      timestamp: 4,
+    },
+  ];
+
+  const result = getAllAssistantText(messages);
+  assert.equal(result, "First message content.\n\nSecond message content.\n\nThird message content.");
+});
+
+test("getAllAssistantText returns empty string for non-array input", () => {
+  assert.equal(getAllAssistantText(null), "");
+  assert.equal(getAllAssistantText(undefined), "");
+  assert.equal(getAllAssistantText("not an array"), "");
+});
+
+test("getAllAssistantText skips messages without text content", () => {
+  const messages = [
+    { role: "assistant", content: [{ type: "toolCall", name: "test" }], timestamp: 1 },
+    { role: "assistant", content: [], timestamp: 2 },
+    { role: "assistant", content: [{ type: "text", text: "Has text" }], timestamp: 3 },
+  ];
+
+  assert.equal(getAllAssistantText(messages), "Has text");
 });
 
 test("maxTurns enforcement stops processing when limit is reached", () => {

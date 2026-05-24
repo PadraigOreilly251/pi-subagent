@@ -151,6 +151,32 @@ export function getFinalAssistantText(messages) {
   return "";
 }
 
+/**
+ * Collect ALL assistant text content across all messages (not just the last one).
+ * This ensures structured output from earlier assistant turns is visible to the main agent.
+ */
+export function getAllAssistantText(messages) {
+  if (!Array.isArray(messages)) return "";
+
+  const texts = [];
+  for (const message of messages) {
+    if (!message || message.role !== "assistant" || !Array.isArray(message.content)) {
+      continue;
+    }
+
+    for (const part of message.content) {
+      if (part?.type === "text" && typeof part.text === "string" && part.text.length > 0) {
+        texts.push(part.text);
+      }
+    }
+  }
+
+  return texts.join("\n\n");
+}
+
+/**
+ * Get the final assistant text content from a result's messages.
+ */
 export function getResultSummaryText(result) {
   const finalText = getFinalAssistantText(result?.messages);
   if (finalText) return finalText;
