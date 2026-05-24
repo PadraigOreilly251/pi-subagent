@@ -35,7 +35,7 @@ export interface SingleResult {
 	errorMessage?: string;
 	sawAgentEnd?: boolean;
 	timeout?: boolean;
-	maxTurns?: boolean;
+	maxTurns?: number;
 }
 
 /** Metadata attached to every tool result for rendering. */
@@ -121,7 +121,7 @@ export function normalizeCompletedResult(result: SingleResult, wasAborted: boole
 		return result;
 	}
 
-	if (result.maxTurns) {
+	if (result.maxTurns && result.usage.turns >= result.maxTurns) {
 		result.exitCode = 1;
 		result.stopReason = "max_turns";
 		if (!result.errorMessage && result.stderr.trim()) {
