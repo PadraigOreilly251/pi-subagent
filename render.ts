@@ -142,7 +142,7 @@ function renderDisplayItems(
 function statusIcon(r: SingleResult, theme: { fg: ThemeFg }): string {
 	if (r.exitCode === -1) return theme.fg("warning", "⏳");
 	if (r.timeout) return theme.fg("error", "⏰");
-	if (r.maxTurns) return theme.fg("error", "🔄");
+	if (r.stopReason === "max_turns") return theme.fg("error", "🔄");
 	return isResultError(r) ? theme.fg("error", "✗") : theme.fg("success", "✓");
 }
 
