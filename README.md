@@ -1,6 +1,6 @@
 # Pi Subagent for LocalLLMs
 
-Forked from [BenjaminBilbro/pi-subagent](https://github.com/BenjaminBilbro/pi-subagent), itself forked from [mjakl/pi-subagent](https://github.com/mjakl/pi-subagent). Shoutout for clean, concise baselines.
+Forked from [BenjaminBilbro/pi-subagent](https://github.com/BenjaminBilbro/pi-subagent), itself forked from [mjakl/pi-subagent](https://github.com/mjakl/pi-subagent). I fully acknowledge that my fork is pure unadulterated AI slop, for my own personal use. Use or adapt at your own risk.
 
 **Delegate tasks to isolated sub-agents running in separate `pi` processes.**
 
