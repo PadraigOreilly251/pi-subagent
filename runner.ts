@@ -12,9 +12,6 @@
  */
 
 import { spawn } from "node:child_process";
-import * as fs from "node:fs";
-import * as os from "node:os";
-import * as path from "node:path";
 import type { AgentToolResult } from "@mariozechner/pi-agent-core";
 import { parseInheritedCliArgs } from "./runner-cli.js";
 import { processPiJsonLine } from "./runner-events.js";
@@ -29,6 +26,18 @@ const isWindows = process.platform === "win32";
 const SIGKILL_TIMEOUT_MS = 5000;
 const AGENT_END_GRACE_MS = 250;
 const PI_OFFLINE_ENV = "PI_OFFLINE";
+
+/**
+ * Silence timeout: kill subagent if no JSON output for this long.
+ * Reset on each received event line.
+ */
+const SILENCE_TIMEOUT_MS = 120_000;
+
+/**
+ * Absolute max execution time safety net.
+ * Prevents runaway processes even if subagent keeps producing output.
+ */
+const MAX_EXECUTION_MS = 3_600_000;
 
 type OnUpdateCallback = (partial: AgentToolResult) => void;
 
@@ -45,28 +54,6 @@ function resolvePiSpawn(): { command: string; prefixArgs: string[] } {
 }
 
 // ---------------------------------------------------------------------------
-// Temp file helpers
-// ---------------------------------------------------------------------------
-
-function writeForkSessionToTempFile(
-  sessionJsonl: string,
-): { dir: string; filePath: string } {
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-"));
-  const filePath = path.join(tmpDir, `session.jsonl`);
-  fs.writeFileSync(filePath, sessionJsonl, { encoding: "utf-8", mode: 0o600 });
-  return { dir: tmpDir, filePath };
-}
-
-function cleanupTempDir(dir: string | null): void {
-  if (!dir) return;
-  try {
-    fs.rmSync(dir, { recursive: true, force: true });
-  } catch {
-    /* ignore */
-  }
-}
-
-// ---------------------------------------------------------------------------
 // Build pi CLI arguments
 // ---------------------------------------------------------------------------
 
@@ -74,7 +61,6 @@ const inheritedCliArgs = parseInheritedCliArgs(process.argv);
 
 function buildPiArgs(
   task: string,
-  forkSessionPath: string | null,
   taskCwd: string | undefined,
 ): string[] {
   const args: string[] = [
@@ -83,12 +69,8 @@ function buildPiArgs(
     ...inheritedCliArgs.extensionArgs,
     ...inheritedCliArgs.alwaysProxy,
     "-p",
+    "--no-session",
   ];
-
-  // Fork mode: use the parent's session snapshot (full conversation history)
-  if (forkSessionPath) {
-    args.push("--session", forkSessionPath);
-  }
 
   // Always inherit the parent's tools by default.
   // Sub-agents must have the same tool set as the parent to preserve KV cache.
@@ -118,15 +100,16 @@ export interface RunAgentOptions {
   task: string;
   /** Optional override working directory. */
   taskCwd?: string;
-  /** Serialized parent session snapshot (full conversation in JSONL). */
-  forkSessionSnapshotJsonl?: string;
   /** Abort signal for cancellation. */
   signal?: AbortSignal;
   /** Streaming update callback. */
   onUpdate?: OnUpdateCallback;
   /** Factory to wrap results into SubagentDetails. */
   makeDetails: (results: SingleResult[]) => { results: SingleResult[] };
-  /** Maximum execution time in milliseconds. Default: 120000 (120s). */
+  /**
+   * Deprecated: no longer used as wall-clock timeout.
+   * Runner uses heartbeat-based silence detection (120s) + max execution safety net (1hr).
+   */
   timeout?: number;
   /** Maximum number of assistant turns (LLM calls). Default: 50. */
   maxTurns?: number;
@@ -143,26 +126,11 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
     agentName,
     task,
     taskCwd,
-    forkSessionSnapshotJsonl,
     signal,
     onUpdate,
     makeDetails,
-    timeout = 120_000,
     maxTurns = 50,
   } = opts;
-
-  if (!forkSessionSnapshotJsonl || !forkSessionSnapshotJsonl.trim()) {
-    return {
-      agent: agentName,
-      task,
-      exitCode: 1,
-      messages: [],
-      stderr: "Cannot run sub-agent: missing parent session snapshot context.",
-      usage: emptyUsage(),
-      stopReason: "error",
-      errorMessage: "Cannot run sub-agent: missing parent session snapshot context.",
-    };
-  }
 
   const result: SingleResult = {
     agent: agentName,
@@ -186,20 +154,10 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
     });
   };
 
-  // Write forked session snapshot to temp file
-  let forkSessionTmpDir: string | null = null;
-  let forkSessionTmpPath: string | null = null;
-  if (forkSessionSnapshotJsonl) {
-    const tmp = writeForkSessionToTempFile(forkSessionSnapshotJsonl);
-    forkSessionTmpDir = tmp.dir;
-    forkSessionTmpPath = tmp.filePath;
-  }
-
-  try {
-    const piArgs = buildPiArgs(task, forkSessionTmpPath, taskCwd);
+  {
+    const piArgs = buildPiArgs(task, taskCwd);
     let wasAborted = false;
     let timedOut = false;
-    let exceededMaxTurns = false;
 
     const exitCode = await new Promise<number>((resolve) => {
       const { command, prefixArgs } = resolvePiSpawn();
@@ -223,16 +181,21 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
       let settled = false;
       let abortHandler: (() => void) | undefined;
       let semanticCompletionTimer: NodeJS.Timeout | undefined;
-      let timeoutTimer: NodeJS.Timeout | undefined;
+      let silenceTimer: NodeJS.Timeout | undefined;
+      let maxExecutionTimer: NodeJS.Timeout | undefined;
 
       const clearTimers = () => {
         if (semanticCompletionTimer) {
           clearTimeout(semanticCompletionTimer);
           semanticCompletionTimer = undefined;
         }
-        if (timeoutTimer) {
-          clearTimeout(timeoutTimer);
-          timeoutTimer = undefined;
+        if (silenceTimer) {
+          clearTimeout(silenceTimer);
+          silenceTimer = undefined;
+        }
+        if (maxExecutionTimer) {
+          clearTimeout(maxExecutionTimer);
+          maxExecutionTimer = undefined;
         }
       };
 
@@ -264,9 +227,35 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
         resolve(code);
       };
 
+      const resetSilenceTimer = () => {
+        if (silenceTimer) clearTimeout(silenceTimer);
+        if (didClose || settled || timedOut) return;
+        silenceTimer = setTimeout(() => {
+          if (didClose || settled) return;
+          // No output for SILENCE_TIMEOUT_MS — assume stuck/crashed
+          timedOut = true;
+          result.timeout = true;
+          result.stopReason = "timeout";
+          result.exitCode = 124;
+          // Flush any buffered data before killing (preserve partial output)
+          if (buffer.trim()) flushBufferedLines(buffer);
+          result.errorMessage = `Sub-agent silent for ${SILENCE_TIMEOUT_MS / 1000}s (${result.usage.turns} turns completed). Assuming stuck.`;
+          if (!result.stderr.trim()) {
+            result.stderr = result.errorMessage;
+          }
+          terminateChild();
+          setTimeout(() => {
+            if (!settled) finish(124);
+          }, SIGKILL_TIMEOUT_MS + 500);
+        }, SILENCE_TIMEOUT_MS);
+        silenceTimer.unref();
+      };
+
       const flushLine = (line: string) => {
-        if (exceededMaxTurns) return;
+        if (timedOut) return;
         if (processPiJsonLine(line, result)) emitUpdate();
+        // Reset silence timer on any JSON event — subagent is alive
+        resetSilenceTimer();
         maybeFinishFromAgentEnd();
       };
 
@@ -301,26 +290,37 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
       };
 
       const onStderrData = (chunk: Buffer) => {
-        result.stderr += chunk.toString();
+        // Strip control characters (bell, escape sequences, etc.) from stderr
+        // pi --mode json -p outputs \u0007 (bell) to stderr on completion
+        const cleaned = chunk.toString().replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
+        result.stderr += cleaned;
       };
 
       proc.stdout.on("data", onStdoutData);
       proc.stderr.on("data", onStderrData);
 
-      // Timeout handling
-      timeoutTimer = setTimeout(() => {
+      // Silence timer — starts when process spawns, resets on each event
+      resetSilenceTimer();
+
+      // Max execution safety net — fires once, never resets
+      maxExecutionTimer = setTimeout(() => {
         if (didClose || settled) return;
         timedOut = true;
         result.timeout = true;
-        result.exitCode = 124;
         result.stopReason = "timeout";
-        result.errorMessage = `Sub-agent timed out after ${timeout / 1000}s`;
-        result.stderr = `Sub-agent timed out after ${timeout / 1000}s`;
+        result.exitCode = 124;
+        // Flush buffered data before killing (preserve partial output)
+        if (buffer.trim()) flushBufferedLines(buffer);
+        result.errorMessage = `Sub-agent exceeded max execution time (${MAX_EXECUTION_MS / 1000 / 60}min, ${result.usage.turns} turns).`;
+        if (!result.stderr.trim()) {
+          result.stderr = result.errorMessage;
+        }
         terminateChild();
         setTimeout(() => {
           if (!settled) finish(124);
         }, SIGKILL_TIMEOUT_MS + 500);
-      }, timeout);
+      }, MAX_EXECUTION_MS);
+      maxExecutionTimer.unref();
 
       proc.on("close", (code) => {
         didClose = true;
@@ -350,7 +350,5 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
 
     result.exitCode = exitCode;
     return normalizeCompletedResult(result, wasAborted);
-  } finally {
-    cleanupTempDir(forkSessionTmpDir);
   }
 }
