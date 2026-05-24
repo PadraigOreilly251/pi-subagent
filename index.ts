@@ -18,12 +18,34 @@ import { Type } from "@sinclair/typebox";
 import { renderCall, renderResult } from "./render.js";
 import { getFinalAssistantText, getResultSummaryText } from "./runner-events.js";
 import { runAgent } from "./runner.js";
-import {
-	type SingleResult,
-	emptyUsage,
-	isResultError,
-	isResultSuccess,
-} from "./types.js";
+import { type SingleResult, emptyUsage, isResultError } from "./types.js";
+
+// ---------------------------------------------------------------------------
+// Helpers (inlined to avoid jiti CJS/ESM interop issues with runner-events.js)
+// ---------------------------------------------------------------------------
+
+/**
+ * Collect ALL assistant text content across all messages (not just the last one).
+ * This ensures structured output from earlier assistant turns is visible to the main agent.
+ */
+function getAllAssistantText(messages) {
+	if (!Array.isArray(messages)) return "";
+
+	const texts = [];
+	for (const message of messages) {
+		if (!message || message.role !== "assistant" || !Array.isArray(message.content)) {
+			continue;
+		}
+
+		for (const part of message.content) {
+			if (part?.type === "text" && typeof part.text === "string" && part.text.length > 0) {
+				texts.push(part.text);
+			}
+		}
+	}
+
+	return texts.join("\n\n");
+}
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -52,35 +74,41 @@ Your primary goal is to accomplish the task and report back to the main agent.
 Another way to tell if you are in sub-agent mode is to look at the most recent tool call. You will see the sub-agent tool call followed by an empty tool result "No result provided". You ARE the tool result actively running in sub-agent mode.
 This means your final response will be the tool_result.
 
-### When to Use a Sub-Agent
-
-Use sub-agents when you need to:
-- Do heavy research across many files without polluting your context
-- Run long-running tasks that would consume your context window
-- Offload specialized work while you continue other tasks
-- Preserve context efficiency by keeping only summaries in your context
-
-A sub-agent will have FULL context for all tool calls/results and message history up until the point you spawn it, meaning it will know exactly what you know. Keep this in mind while defining a full task statement.
-
 ### Calling the Subagent Tool
 
 \`\`\`
 subagent({
   name: "researcher",     // Freeform name (human-like, for your reference)
   task: "Research the latest about quantum computing",
-  timeout: 180,           // Optional: max seconds (default: 600)
-  maxTurns: 80,           // Optional: max LLM turns (default: 50)
+  timeout: 600,           // Optional: max seconds (default: 600). Local LLMs slow — set generous.
+  maxTurns: 50,           // Optional: max LLM turns (default: 50)
   cwd: "/path/to/dir"     // Optional: working directory
 })
 \`\`\`
 
+### Timeout rule (IMPORTANT)
 
-### Best Practices
+Local LLMs run 2-10 tok/s. Large context = slow first turn.
+Always set explicit timeout + maxTurns. Formula: maxTurns × 10s = min timeout.
+- Quick lookup (1-3 calls): maxTurns:10, timeout:120
+- Deep research (5+ calls): maxTurns:50, timeout:600
 
-1. Give sub-agents clear, specific task descriptions
-2. Set appropriate timeouts for long-running tasks
-3. Let sub-agents write results to files — you can read them back
-4. Use sub-agents to consolidate knowledge into summaries before bringing it back into your context
+### Timeout recovery
+
+Subagent timeout = task too broad. Split and retry, don't just increase timeout.
+**Partial output IS preserved** — read it from tool result before splitting.
+Split task into 2 independent subtasks, run sequentially.
+See \`subagent\` skill (/skill:subagent) → Timeout recovery for full pattern.
+
+### Subagent mode rules (IMPORTANT)
+
+1. **Do NOT use the quest tool.** Quest IDs are meaningless in subagent context. Your quests don't affect the parent. Skip quest management entirely.
+
+2. **Do NOT call tools in parallel.** MCP transport can't handle concurrent requests. Call web_search, web_fetch, and other tools one at a time, sequentially. Parallel calls fail with transport errors.
+
+3. **Your final message = your full output.** The main agent only sees your final text. Put ALL findings in your last message. Don't say "Done." without including the actual data.
+
+See \`subagent\` skill (/skill:subagent) for full best practices.
 `;
 
 // ---------------------------------------------------------------------------
@@ -116,27 +144,6 @@ const SubagentParams = Type.Object({
 });
 
 // ---------------------------------------------------------------------------
-// Session snapshot helper
-// ---------------------------------------------------------------------------
-
-interface SessionSnapshotSource {
-	getHeader: () => unknown;
-	getBranch: () => unknown[];
-}
-
-function buildForkSessionSnapshotJsonl(
-	sessionManager: SessionSnapshotSource,
-): string | null {
-	const header = sessionManager.getHeader();
-	if (!header || typeof header !== "object") return null;
-
-	const branchEntries = sessionManager.getBranch();
-	const lines = [JSON.stringify(header)];
-	for (const entry of branchEntries) lines.push(JSON.stringify(entry));
-	return `${lines.join("\n")}\n`;
-}
-
-// ---------------------------------------------------------------------------
 // Extension entry point
 // ---------------------------------------------------------------------------
 
@@ -159,34 +166,16 @@ export default function (pi: ExtensionAPI) {
 			"The sub-agent inherits your full session context (conversation history + system prompt).",
 			"",
 			"Optional parameters:",
-			"  timeout: Max execution time in seconds (default: 120)",
+			"  timeout: Max execution time in seconds (default: 600)",
 			"  maxTurns: Max LLM turns/calls (default: 50)",
 			"",
-			"Example: { name: \"researcher\", task: \"Research the latest about quantum computing\", timeout: 180 }",
+			"Example: { name: \"researcher\", task: \"Research the latest about quantum computing\", timeout: 600 }",
 		].join("\n"),
 		parameters: SubagentParams,
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
-			// Build session snapshot for fork mode (full context inheritance)
-			let forkSessionSnapshotJsonl: string | undefined;
-			forkSessionSnapshotJsonl = buildForkSessionSnapshotJsonl(
-				ctx.sessionManager,
-			);
-			if (!forkSessionSnapshotJsonl) {
-				return {
-					content: [
-						{
-							type: "text",
-							text: "Cannot spawn sub-agent: failed to snapshot current session context.",
-						},
-					],
-					details: { results: [] },
-					isError: true,
-				};
-			}
-
-			// Execute sub-agent
-			const timeoutMs = (params.timeout ?? 120) * 1000;
+			// Execute sub-agent — fresh pi process, inherits model + tools via CLI args
+			const timeoutMs = (params.timeout ?? 600) * 1000;
 			const maxTurns = params.maxTurns ?? 50;
 
 			const result = await runAgent({
@@ -194,7 +183,6 @@ export default function (pi: ExtensionAPI) {
 				agentName: params.name,
 				task: params.task,
 				taskCwd: params.cwd,
-				forkSessionSnapshotJsonl,
 				signal,
 				onUpdate,
 				makeDetails: (results) => ({ results }),
@@ -202,24 +190,103 @@ export default function (pi: ExtensionAPI) {
 				maxTurns,
 			});
 
-			console.error(`[DEBUG execute] isResultError check: exitCode=${result.exitCode} stopReason=${result.stopReason} sawAgentEnd=${result.sawAgentEnd} messages.length=${result.messages.length} stderr=${result.stderr.substring(0,100)} hasFinalText=${getFinalAssistantText(result.messages).substring(0,80)}`);
-			if (isResultError(result)) {
+			if (result.stopReason === "timeout") {
+				// Timeout with potential partial output — return actionable guidance
+				const partialText = getFinalAssistantText(result.messages);
+				const summary = partialText
+					? `Partial result before timeout:\n${partialText}\n\n`
+					: "";
+				const turnInfo = result.usage.turns > 0
+					? `${result.usage.turns} turns completed`
+					: "no turns completed";
 				return {
 					content: [
 						{
 							type: "text" as const,
-							text: `Sub-agent failed: ${getResultSummaryText(result)}`,
+							text:
+								`${summary}Sub-agent timed out (${turnInfo}).\n\n` +
+								`This task was too broad for one sub-agent. Split into smaller pieces:\n` +
+								`1. Divide task into 2-3 independent subtasks\n` +
+								`2. Run each as separate subagent with smaller maxTurns\n` +
+								`3. Compile results after all subtasks complete\n` +
+								`\nExample:\n` +
+								`subagent({ name: "part1", task: "do X only", maxTurns: 10, timeout: 120 })\n` +
+								`subagent({ name: "part2", task: "do Y only", maxTurns: 10, timeout: 120 })\n` +
+								`\nSee /skill:subagent → Timeout recovery for full pattern.`,
 						},
 					],
 					details: { results: [result] },
 					isError: true,
 				};
 			}
+
+			if (result.stopReason === "max_turns") {
+				// Max turns reached — return partial output with actionable guidance
+				const partialText = getAllAssistantText(result.messages);
+				const turnInfo = result.usage.turns > 0
+					? `${result.usage.turns} turns completed`
+					: "no turns completed";
+
+				if (partialText) {
+					return {
+						content: [
+							{
+								type: "text" as const,
+								text:
+									`Partial result (max turns — ${turnInfo}):\n${partialText}\n\n` +
+									`Sub-agent reached max turns (${result.maxTurns}) before completing. ` +
+									`Split remaining work into smaller subtasks:\n` +
+									`1. Divide incomplete task into 2-3 independent subtasks\n` +
+									`2. Run each as separate subagent with smaller maxTurns\n` +
+									`3. Compile results after all subtasks complete\n` +
+									`\nSee /skill:subagent → Timeout recovery for full pattern.`,
+							},
+						],
+						details: { results: [result] },
+						isError: true,
+					};
+				}
+				// No partial text — just guidance
+				return {
+					content: [
+						{
+							type: "text" as const,
+							text:
+								`Sub-agent reached max turns (${result.maxTurns}, ${turnInfo}) with no output. ` +
+								`Task too broad. Split into smaller pieces with fewer maxTurns each.\n` +
+								`\nExample:\n` +
+								`subagent({ name: \"part1\", task: \"do X only\", maxTurns: 10, timeout: 120 })\n` +
+								`subagent({ name: \"part2\", task: \"do Y only\", maxTurns: 10, timeout: 120 })\n` +
+								`\nSee /skill:subagent → Timeout recovery for full pattern.`,
+						},
+					],
+					details: { results: [result] },
+					isError: true,
+				};
+			}
+
+			if (isResultError(result)) {
+				const partialText = getAllAssistantText(result.messages);
+				const displayText = partialText || getResultSummaryText(result);
+				return {
+					content: [
+						{
+							type: "text" as const,
+							text: displayText,
+						},
+					],
+					details: { results: [result] },
+					isError: true,
+				};
+			}
+			// Use full output (all assistant text, not just last message)
+			const fullOutput = getAllAssistantText(result.messages);
+			const displayText = fullOutput || getResultSummaryText(result);
 			return {
 				content: [
 					{
 						type: "text" as const,
-						text: getResultSummaryText(result),
+						text: displayText,
 					},
 				],
 				details: { results: [result] },
