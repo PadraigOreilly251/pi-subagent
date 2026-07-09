@@ -18,7 +18,72 @@ import { Type } from "@sinclair/typebox";
 import { renderCall, renderResult } from "./render.js";
 import { getFinalAssistantText, getResultSummaryText } from "./runner-events.js";
 import { runAgent } from "./runner.js";
-import { type SingleResult, emptyUsage, isResultError } from "./types.js";
+import {
+	type SingleResult,
+	emptyUsage,
+	isResultError,
+	isResultRecoverable,
+	getLastToolCall,
+} from "./types.js";
+
+// ---------------------------------------------------------------------------
+// Task size analysis
+// ---------------------------------------------------------------------------
+
+/**
+ * Analyze a task description and warn if it looks too broad for the given params.
+ * Returns an optional warning string to prepend to results, or null if task looks fine.
+ */
+function analyzeTaskSize(
+	task: string,
+	maxTurns: number,
+): { severity: "warn" | "error"; text: string } | null {
+	const lower = task.toLowerCase();
+
+	// Count indicators of a large/complex task
+	const breadthSignals =
+		(lower.includes("research") || lower.includes("investigate") ? 1 : 0) +
+		(lower.includes("comprehensive") || lower.includes("thorough") || lower.includes("deep dive") ? 2 : 0) +
+		(lower.includes("across multiple") || lower.includes("from multiple sources") ? 2 : 0) +
+		(lower.includes("all of") || lower.includes("everything about") ? 3 : 0) +
+		// Counting commas or "and" separated items as a rough task-count proxy
+		((task.match(/,\s*(?:then|also|and)\s/gi) || []).length > 2 ? 2 : 0);
+
+	const depthSignals =
+		(lower.includes("implement") && (lower.includes("full") || lower.includes("complete")) ? 3 : 0) +
+		(lower.includes("write report") || lower.includes("compile") ? 2 : 0) +
+		((task.match(/\bweb_fetch|scrape|parse|document/gi) || []).length >= 2 ? 2 : 0);
+
+	const taskComplexity = breadthSignals + depthSignals;
+	const estimatedTurnsNeeded =
+		Math.max(5, (breadthSignals * 6) + (depthSignals * 4));
+
+	// Too many subtasks for the given maxTurns budget
+	if (estimatedTurnsNeeded > maxTurns * 1.5) {
+		return {
+			severity: "error",
+			text:
+				`⚠️ Task complexity warning: this task looks broad (~${estimatedTurnsNeeded} turns estimated, maxTurns=${maxTurns}). ` +
+				`Consider splitting before running to avoid timeout.
+
+`,
+		};
+	}
+
+	// Mild warning — task might be large but within budget
+	if (taskComplexity >= 5 && estimatedTurnsNeeded > maxTurns * 0.8) {
+		return {
+			severity: "warn",
+			text:
+				`⚠️ Task complexity warning: this task is moderately complex (~${estimatedTurnsNeeded} turns). ` +
+				`You may want to split it or increase maxTurns.
+
+`,
+		};
+	}
+
+	return null;
+}
 
 // ---------------------------------------------------------------------------
 // Helpers (inlined to avoid jiti CJS/ESM interop issues with runner-events.js)
@@ -68,7 +133,7 @@ You will know sub-agent mode is active when you see a user message that follows 
 **[BEGIN SUB AGENT MODE]**: <prompt and task will go here>
 \`\`\`
 
-Once you see that then you will be operating in sub-agent mode, where you have an assigned task and should work to complete it. You will not be able to spawn any sub agents while operating in sub agent mode.
+Once you see that then you will be operating in sub-agent mode, where you have an assigned task and should work to complete it.
 Your primary goal is to accomplish the task and report back to the main agent.
 
 Another way to tell if you are in sub-agent mode is to look at the most recent tool call. You will see the sub-agent tool call followed by an empty tool result "No result provided". You ARE the tool result actively running in sub-agent mode.
@@ -102,11 +167,15 @@ See \`subagent\` skill (/skill:subagent) → Timeout recovery for full pattern.
 
 ### Subagent mode rules (IMPORTANT)
 
-1. **Do NOT use the quest tool.** Quest IDs are meaningless in subagent context. Your quests don't affect the parent. Skip quest management entirely.
+These rules apply ONLY while you are in sub-agent mode, not when you are the main agent.
 
-2. **Do NOT call tools in parallel.** MCP transport can't handle concurrent requests. Call web_search, web_fetch, and other tools one at a time, sequentially. Parallel calls fail with transport errors.
+1. **Do NOT spawn sub-agents.** The \`subagent\` tool is blocked and will error. All research, file operations, and analysis must be done directly by you using available tools (web_search, read, bash, etc.).
 
-3. **Your final message = your full output.** The main agent only sees your final text. Put ALL findings in your last message. Don't say "Done." without including the actual data.
+2. **Do NOT use the quest tool.** Quest IDs are meaningless in subagent context. Your quests don't affect the parent. Skip quest management entirely.
+
+3. **Do NOT call tools in parallel.** MCP transport can't handle concurrent requests. Call web_search, web_fetch, and other tools one at a time, sequentially. Parallel calls fail with transport errors.
+
+4. **Your final message = your full output.** The main agent only sees your final text. Put ALL findings in your last message. Don't say "Done." without including the actual data.
 
 See \`subagent\` skill (/skill:subagent) for full best practices.
 `;
@@ -174,9 +243,18 @@ export default function (pi: ExtensionAPI) {
 		parameters: SubagentParams,
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
-			// Execute sub-agent — fresh pi process, inherits model + tools via CLI args
 			const timeoutMs = (params.timeout ?? 600) * 1000;
 			const maxTurns = params.maxTurns ?? 50;
+
+			// Pre-flight task size check — warn if task looks too broad
+			const taskWarning = analyzeTaskSize(params.task, maxTurns);
+			let warningPrefix = "";
+			if (taskWarning) {
+				warningPrefix =
+					taskWarning.severity === "error"
+						? `\n${taskWarning.text}`
+						: `\n${taskWarning.text}`;
+			}
 
 			const result = await runAgent({
 				cwd: ctx.cwd,
@@ -190,29 +268,73 @@ export default function (pi: ExtensionAPI) {
 				maxTurns,
 			});
 
-			if (result.stopReason === "timeout") {
-				// Timeout with potential partial output — return actionable guidance
-				const partialText = getFinalAssistantText(result.messages);
+			// Shared diagnostic helpers
+			const partialText = getAllAssistantText(result.messages);
+			const lastTool = getLastToolCall(result.messages);
+			const turnInfo = result.usage.turns > 0
+				? `${result.usage.turns} turn${result.usage.turns !== 1 ? "s" : ""} completed`
+				: "no turns completed";
+
+			const makeDiagnosticFooter = () => {
+				const parts: string[] = [];
+				if (result.exitCode !== undefined && result.exitCode > 0) {
+					parts.push(`exit code: ${result.exitCode}`);
+				}
+				parts.push(turnInfo);
+				if (lastTool) {
+					parts.push(`last tool: ${lastTool.name}`);
+				}
+				return parts.join(" · ");
+			};
+
+			const makeSplitGuidance = () =>
+				`\n\nSplit into smaller pieces:\n` +
+				`1. Divide task into 2-3 independent subtasks\n` +
+				`2. Run each as separate subagent with fewer maxTurns\n` +
+				`3. Compile results after all complete\n` +
+				`\nExample:\n` +
+				`subagent({ name: "part1", task: "do X only", maxTurns: 10, timeout: 120 })\n` +
+				`subagent({ name: "part2", task: "do Y only", maxTurns: 10, timeout: 120 })\n` +
+				`\nSee /skill:subagent → Timeout recovery for full pattern.`;
+
+			// ── SIGTERM (exit 143): auto-retried by runner.ts ──────────────────────
+			if (result.stopReason === "sigterm") {
 				const summary = partialText
-					? `Partial result before timeout:\n${partialText}\n\n`
+					? `Partial result:\n${partialText}\n\n`
 					: "";
-				const turnInfo = result.usage.turns > 0
-					? `${result.usage.turns} turns completed`
-					: "no turns completed";
 				return {
 					content: [
 						{
 							type: "text" as const,
 							text:
-								`${summary}Sub-agent timed out (${turnInfo}).\n\n` +
-								`This task was too broad for one sub-agent. Split into smaller pieces:\n` +
-								`1. Divide task into 2-3 independent subtasks\n` +
-								`2. Run each as separate subagent with smaller maxTurns\n` +
-								`3. Compile results after all subtasks complete\n` +
-								`\nExample:\n` +
-								`subagent({ name: "part1", task: "do X only", maxTurns: 10, timeout: 120 })\n` +
-								`subagent({ name: "part2", task: "do Y only", maxTurns: 10, timeout: 120 })\n` +
-								`\nSee /skill:subagent → Timeout recovery for full pattern.`,
+								warningPrefix +
+								`⚡ Sub-agent killed by SIGTERM (exit 143) after ${makeDiagnosticFooter()}.\n` +
+								`This means the subagent process received a termination signal — usually ` +
+								`a wall-clock timeout from an external watcher. The runner retried automatically.\n\n` +
+								`${summary}` +
+								makeSplitGuidance(),
+						},
+					],
+					details: { results: [result] },
+					isError: true,
+				};
+			}
+
+			// ── Timeout ───────────────────────────────────────────────────────────
+			if (result.stopReason === "timeout") {
+				const summary = partialText
+					? `Partial result before timeout:\n${partialText}\n\n`
+					: "";
+				return {
+					content: [
+						{
+							type: "text" as const,
+							text:
+								warningPrefix +
+								`⏰ Sub-agent timed out — ${makeDiagnosticFooter()}.\n` +
+								`${summary}` +
+								`Task too broad for one sub-agent.` +
+								makeSplitGuidance(),
 						},
 					],
 					details: { results: [result] },
@@ -221,43 +343,19 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (result.stopReason === "max_turns") {
-				// Max turns reached — return partial output with actionable guidance
-				const partialText = getAllAssistantText(result.messages);
-				const turnInfo = result.usage.turns > 0
-					? `${result.usage.turns} turns completed`
-					: "no turns completed";
-
-				if (partialText) {
-					return {
-						content: [
-							{
-								type: "text" as const,
-								text:
-									`Partial result (max turns — ${turnInfo}):\n${partialText}\n\n` +
-									`Sub-agent reached max turns (${result.maxTurns}) before completing. ` +
-									`Split remaining work into smaller subtasks:\n` +
-									`1. Divide incomplete task into 2-3 independent subtasks\n` +
-									`2. Run each as separate subagent with smaller maxTurns\n` +
-									`3. Compile results after all subtasks complete\n` +
-									`\nSee /skill:subagent → Timeout recovery for full pattern.`,
-							},
-						],
-						details: { results: [result] },
-						isError: true,
-					};
-				}
-				// No partial text — just guidance
+				const summary = partialText
+					? `Partial result:\n${partialText}\n\n`
+					: "";
 				return {
 					content: [
 						{
 							type: "text" as const,
 							text:
-								`Sub-agent reached max turns (${result.maxTurns}, ${turnInfo}) with no output. ` +
-								`Task too broad. Split into smaller pieces with fewer maxTurns each.\n` +
-								`\nExample:\n` +
-								`subagent({ name: \"part1\", task: \"do X only\", maxTurns: 10, timeout: 120 })\n` +
-								`subagent({ name: \"part2\", task: \"do Y only\", maxTurns: 10, timeout: 120 })\n` +
-								`\nSee /skill:subagent → Timeout recovery for full pattern.`,
+								warningPrefix +
+								`🔄 Sub-agent hit max turns (${result.maxTurns}) — ${makeDiagnosticFooter()}.\n` +
+								`${summary}` +
+								`Task too broad. Reduce maxTurns and split into focused subtasks.` +
+								makeSplitGuidance(),
 						},
 					],
 					details: { results: [result] },
@@ -266,35 +364,40 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (isResultError(result)) {
-				const partialText = getAllAssistantText(result.messages);
 				const displayText = partialText || getResultSummaryText(result);
 				return {
 					content: [
 						{
 							type: "text" as const,
-							text: displayText,
+							text:
+								warningPrefix +
+								`✗ Sub-agent failed — ${makeDiagnosticFooter()}.\n` +
+								`${result.errorMessage ? result.errorMessage + "\n\n" : ""}` +
+								(displayText && displayText !== getResultSummaryText(result) ? displayText + "\n\n" : "") +
+								(isResultRecoverable(result)
+									? "This is a recoverable failure. Try splitting the task and retrying.\n" + makeSplitGuidance()
+									: "Non-recoverable error. Check input validity.\n"),
 						},
 					],
 					details: { results: [result] },
 					isError: true,
 				};
 			}
-			// Use full output (all assistant text, not just last message)
-			const fullOutput = getAllAssistantText(result.messages);
-			const displayText = fullOutput || getResultSummaryText(result);
+
+			// Success path
 			return {
 				content: [
 					{
 						type: "text" as const,
-						text: displayText,
+						text: partialText || getResultSummaryText(result) || "Sub-agent completed successfully.",
 					},
 				],
 				details: { results: [result] },
 			};
 		},
 
-		renderCall: (args, theme) => renderCall(args, theme),
-		renderResult: (result, { expanded }, theme) =>
-			renderResult(result, expanded, theme),
+	renderCall: (args, theme) => renderCall(args, theme),
+	renderResult: (result, { expanded }, theme) =>
+		renderResult(result, expanded, theme),
 	});
 }
