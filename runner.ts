@@ -5,10 +5,10 @@
  * Sub-agents inherit the exact same system prompt as the main agent
  * (no --append-system-prompt). Task is delivered as a user message.
  *
- * Simplified model:
- * - No named agents or config files
- * - Sub-agents inherit parent's model/tools/thinking
- * - Sub-agents cannot spawn further sub-agents (enforced in runner-events.js)
+ * Features:
+ * - SIGTERM auto-retry: killed subagents retry up to 2x with exponential backoff
+ * - Silence detection: kills stuck processes after 120s of no output
+ * - Max execution cap: hard ceiling at 1 hour per attempt
  */
 
 import { spawn } from "node:child_process";
@@ -28,13 +28,21 @@ const AGENT_END_GRACE_MS = 250;
 const PI_OFFLINE_ENV = "PI_OFFLINE";
 
 /**
+ * SIGTERM auto-retry settings.
+ * Sub-agents killed by SIGTERM (exit 143) are often victims of timing,
+ * not logic errors. Retry with backoff before surfacing failure.
+ */
+const SIGTERM_MAX_RETRIES = 2; // total attempts: initial + 2 retries
+const SIGTERM_BASE_DELAY_MS = 5000;
+
+/**
  * Silence timeout: kill subagent if no JSON output for this long.
  * Reset on each received event line.
  */
 const SILENCE_TIMEOUT_MS = 120_000;
 
 /**
- * Absolute max execution time safety net.
+ * Absolute max execution time safety net per attempt.
  * Prevents runaway processes even if subagent keeps producing output.
  */
 const MAX_EXECUTION_MS = 3_600_000;
@@ -73,15 +81,10 @@ function buildPiArgs(
   ];
 
   // Always inherit the parent's tools by default.
-  // Sub-agents must have the same tool set as the parent to preserve KV cache.
   if (inheritedCliArgs.fallbackTools !== undefined) {
     args.push("--tools", inheritedCliArgs.fallbackTools);
   }
 
-  // NO --append-system-prompt! The sub-agent inherits the main agent's
-  // system prompt (Pi default + APPEND_SYSTEM.md) automatically.
-
-  // Task message with sub-agent marker
   const taskMessage = `[sub-agent-task] Complete this task:\n${task}`;
   args.push(taskMessage);
   return args;
@@ -116,9 +119,228 @@ export interface RunAgentOptions {
 }
 
 /**
- * Spawn a single subagent process and collect its results.
+ * Run a single subagent spawn attempt.
+ * Returns the exit code; mutates `result` in place with all collected state.
+ */
+function runSingleAttempt(
+  result: SingleResult,
+  piArgs: string[],
+  workDir: string,
+  signal: AbortSignal | undefined,
+  onUpdate: OnUpdateCallback | undefined,
+): Promise<number> {
+  let wasAborted = false;
+  let timedOut = false;
+
+  return new Promise<number>((resolve) => {
+    const { command, prefixArgs } = resolvePiSpawn();
+    const proc = spawn(command, [...prefixArgs, ...piArgs], {
+      cwd: workDir,
+      shell: false,
+      stdio: ["pipe", "pipe", "pipe"],
+      env: {
+        ...process.env,
+        [PI_OFFLINE_ENV]: "1",
+      },
+    });
+
+    proc.stdin.on("error", () => {
+      /* ignore broken pipe on fast exits */
+    });
+    proc.stdin.end();
+
+    let buffer = "";
+    let didClose = false;
+    let settled = false;
+    let abortHandler: (() => void) | undefined;
+    let semanticCompletionTimer: NodeJS.Timeout | undefined;
+    let silenceTimer: NodeJS.Timeout | undefined;
+    let maxExecutionTimer: NodeJS.Timeout | undefined;
+
+    const emitUpdate = () => {
+      onUpdate?.({
+        content: [
+          {
+            type: "text",
+            text: getFinalOutput(result.messages) || "(running...)",
+          },
+        ],
+        details: { results: [result] },
+      });
+    };
+
+    const clearTimers = () => {
+      if (semanticCompletionTimer) {
+        clearTimeout(semanticCompletionTimer);
+        semanticCompletionTimer = undefined;
+      }
+      if (silenceTimer) {
+        clearTimeout(silenceTimer);
+        silenceTimer = undefined;
+      }
+      if (maxExecutionTimer) {
+        clearTimeout(maxExecutionTimer);
+        maxExecutionTimer = undefined;
+      }
+    };
+
+    const terminateChild = () => {
+      if (isWindows) {
+        if (proc.pid !== undefined) {
+          const killer = spawn("taskkill", ["/T", "/F", "/PID", String(proc.pid)], {
+            stdio: "ignore",
+          });
+          killer.unref();
+        }
+        return;
+      }
+
+      proc.kill("SIGTERM");
+      const sigkillTimer = setTimeout(() => {
+        if (!didClose) proc.kill("SIGKILL");
+      }, SIGKILL_TIMEOUT_MS);
+      sigkillTimer.unref();
+    };
+
+    const finish = (code: number) => {
+      if (settled) return;
+      settled = true;
+      clearTimers();
+      if (signal && abortHandler) {
+        signal.removeEventListener("abort", abortHandler);
+      }
+      resolve(code);
+    };
+
+    const resetSilenceTimer = () => {
+      if (silenceTimer) clearTimeout(silenceTimer);
+      if (didClose || settled || timedOut) return;
+      silenceTimer = setTimeout(() => {
+        if (didClose || settled) return;
+        // No output for SILENCE_TIMEOUT_MS — assume stuck/crashed
+        timedOut = true;
+        result.timeout = true;
+        result.stopReason = "timeout";
+        result.exitCode = 124;
+        // Flush any buffered data before killing (preserve partial output)
+        if (buffer.trim()) flushBufferedLines(buffer);
+        result.errorMessage = `Sub-agent silent for ${SILENCE_TIMEOUT_MS / 1000}s (${result.usage.turns} turns completed). Assuming stuck.`;
+        if (!result.stderr.trim()) {
+          result.stderr = result.errorMessage ?? "";
+        }
+        terminateChild();
+        setTimeout(() => {
+          if (!settled) finish(124);
+        }, SIGKILL_TIMEOUT_MS + 500);
+      }, SILENCE_TIMEOUT_MS);
+      silenceTimer.unref();
+    };
+
+    const flushLine = (line: string) => {
+      if (timedOut) return;
+      if (processPiJsonLine(line, result)) emitUpdate();
+      // Reset silence timer on any JSON event — subagent is alive
+      resetSilenceTimer();
+      maybeFinishFromAgentEnd();
+    };
+
+    const flushBufferedLines = (text: string) => {
+      for (const line of text.split(/\r?\n/)) {
+        if (line.trim()) flushLine(line);
+      }
+    };
+
+    const maybeFinishFromAgentEnd = () => {
+      if (!result.sawAgentEnd || didClose || settled) return;
+      clearTimers();
+      semanticCompletionTimer = setTimeout(() => {
+        if (didClose || settled || !result.sawAgentEnd) return;
+        if (buffer.trim()) {
+          flushBufferedLines(buffer);
+          buffer = "";
+        }
+        proc.stdout.removeListener("data", onStdoutData);
+        proc.stderr.removeListener("data", onStderrData);
+        finish(0);
+        terminateChild();
+      }, AGENT_END_GRACE_MS);
+      semanticCompletionTimer.unref();
+    };
+
+    const onStdoutData = (chunk: Buffer) => {
+      buffer += chunk.toString();
+      const lines = buffer.split(/\r?\n/);
+      buffer = lines.pop() || "";
+      for (const line of lines) flushLine(line);
+    };
+
+    const onStderrData = (chunk: Buffer) => {
+      // Strip control characters (bell, escape sequences, etc.) from stderr
+      const cleaned = chunk.toString().replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
+      result.stderr += cleaned;
+    };
+
+    proc.stdout.on("data", onStdoutData);
+    proc.stderr.on("data", onStderrData);
+
+    // Silence timer — starts when process spawns, resets on each event
+    resetSilenceTimer();
+
+    // Max execution safety net — fires once, never resets
+    maxExecutionTimer = setTimeout(() => {
+      if (didClose || settled) return;
+      timedOut = true;
+      result.timeout = true;
+      result.stopReason = "timeout";
+      result.exitCode = 124;
+      // Flush buffered data before killing (preserve partial output)
+      if (buffer.trim()) flushBufferedLines(buffer);
+      result.errorMessage = `Sub-agent exceeded max execution time (${MAX_EXECUTION_MS / 1000 / 60}min, ${result.usage.turns} turns).`;
+      if (!result.stderr.trim()) {
+        result.stderr = result.errorMessage ?? "";
+      }
+      terminateChild();
+      setTimeout(() => {
+        if (!settled) finish(124);
+      }, SIGKILL_TIMEOUT_MS + 500);
+    }, MAX_EXECUTION_MS);
+    maxExecutionTimer.unref();
+
+    proc.on("close", (code) => {
+      didClose = true;
+      clearTimers();
+      if (buffer.trim()) flushBufferedLines(buffer);
+      finish(code ?? 0);
+    });
+
+    proc.on("error", (err) => {
+      if (!result.stderr.trim()) result.stderr = err.message;
+      clearTimers();
+      finish(1);
+    });
+
+    // Abort handling
+    if (signal) {
+      abortHandler = () => {
+        if (didClose || settled) return;
+        wasAborted = true;
+        clearTimers();
+        terminateChild();
+      };
+      if (signal.aborted) abortHandler();
+      else signal.addEventListener("abort", abortHandler, { once: true });
+    }
+  });
+}
+
+/**
+ * Spawn a single subagent process with SIGTERM auto-retry.
  *
- * Returns a SingleResult even on failure (exitCode > 0, stderr populated).
+ * On SIGTERM (exit 143), retries up to SIGTERM_MAX_RETRIES times with
+ * exponential backoff. This handles timing-related kills without surfacing
+ * a confusing failure to the user.
+ *
+ * Returns a SingleResult even on failure.
  */
 export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
   const {
@@ -128,227 +350,67 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
     taskCwd,
     signal,
     onUpdate,
-    makeDetails,
     maxTurns = 50,
   } = opts;
 
-  const result: SingleResult = {
+  const workDir = taskCwd ?? cwd;
+  const piArgs = buildPiArgs(task, taskCwd);
+
+  let finalResult: SingleResult = {
     agent: agentName,
     task,
     exitCode: -1,
     messages: [],
     stderr: "",
     usage: emptyUsage(),
-    maxTurns: maxTurns,
+    maxTurns,
   };
 
-  const emitUpdate = () => {
-    onUpdate?.({
-      content: [
-        {
-          type: "text",
-          text: getFinalOutput(result.messages) || "(running...)",
-        },
-      ],
-      details: makeDetails([result]),
-    });
-  };
+  let attempt = 0;
 
-  {
-    const piArgs = buildPiArgs(task, taskCwd);
-    let wasAborted = false;
-    let timedOut = false;
+  while (attempt <= SIGTERM_MAX_RETRIES) {
+    const result: SingleResult = {
+      agent: agentName,
+      task,
+      exitCode: -1,
+      messages: [],
+      stderr: "",
+      usage: emptyUsage(),
+      maxTurns,
+    };
 
-    const exitCode = await new Promise<number>((resolve) => {
-      const { command, prefixArgs } = resolvePiSpawn();
-      const proc = spawn(command, [...prefixArgs, ...piArgs], {
-        cwd: taskCwd ?? cwd,
-        shell: false,
-        stdio: ["pipe", "pipe", "pipe"],
-        env: {
-          ...process.env,
-          [PI_OFFLINE_ENV]: "1",
-        },
-      });
+    if (attempt > 0) {
+      // Exponential backoff: 5s, 15s, 45s…
+      const delay = SIGTERM_BASE_DELAY_MS * Math.pow(3, attempt - 1);
+      await new Promise((r) => setTimeout(r, delay));
+    }
 
-      proc.stdin.on("error", () => {
-        /* ignore broken pipe on fast exits */
-      });
-      proc.stdin.end();
+    const exitCode = await runSingleAttempt(
+      result,
+      piArgs,
+      workDir,
+      signal,
+      onUpdate,
+    );
 
-      let buffer = "";
-      let didClose = false;
-      let settled = false;
-      let abortHandler: (() => void) | undefined;
-      let semanticCompletionTimer: NodeJS.Timeout | undefined;
-      let silenceTimer: NodeJS.Timeout | undefined;
-      let maxExecutionTimer: NodeJS.Timeout | undefined;
+    const wasAborted = signal?.aborted ?? false;
+    const normalized = normalizeCompletedResult(result, wasAborted);
 
-      const clearTimers = () => {
-        if (semanticCompletionTimer) {
-          clearTimeout(semanticCompletionTimer);
-          semanticCompletionTimer = undefined;
-        }
-        if (silenceTimer) {
-          clearTimeout(silenceTimer);
-          silenceTimer = undefined;
-        }
-        if (maxExecutionTimer) {
-          clearTimeout(maxExecutionTimer);
-          maxExecutionTimer = undefined;
-        }
-      };
+    // Merge partial output from previous attempts so nothing is lost
+    if (attempt > 0 && finalResult.messages.length > 0) {
+      normalized.messages = [...finalResult.messages, ...result.messages];
+      normalized.stderr = [finalResult.stderr, result.stderr].filter(Boolean).join("\n");
+    }
 
-      const terminateChild = () => {
-        if (isWindows) {
-          if (proc.pid !== undefined) {
-            const killer = spawn("taskkill", ["/T", "/F", "/PID", String(proc.pid)], {
-              stdio: "ignore",
-            });
-            killer.unref();
-          }
-          return;
-        }
+    finalResult = normalized;
 
-        proc.kill("SIGTERM");
-        const sigkillTimer = setTimeout(() => {
-          if (!didClose) proc.kill("SIGKILL");
-        }, SIGKILL_TIMEOUT_MS);
-        sigkillTimer.unref();
-      };
+    // Success or non-recoverable error — stop retrying
+    if (normalized.stopReason !== "sigterm" || wasAborted) {
+      break;
+    }
 
-      const finish = (code: number) => {
-        if (settled) return;
-        settled = true;
-        clearTimers();
-        if (signal && abortHandler) {
-          signal.removeEventListener("abort", abortHandler);
-        }
-        resolve(code);
-      };
-
-      const resetSilenceTimer = () => {
-        if (silenceTimer) clearTimeout(silenceTimer);
-        if (didClose || settled || timedOut) return;
-        silenceTimer = setTimeout(() => {
-          if (didClose || settled) return;
-          // No output for SILENCE_TIMEOUT_MS — assume stuck/crashed
-          timedOut = true;
-          result.timeout = true;
-          result.stopReason = "timeout";
-          result.exitCode = 124;
-          // Flush any buffered data before killing (preserve partial output)
-          if (buffer.trim()) flushBufferedLines(buffer);
-          result.errorMessage = `Sub-agent silent for ${SILENCE_TIMEOUT_MS / 1000}s (${result.usage.turns} turns completed). Assuming stuck.`;
-          if (!result.stderr.trim()) {
-            result.stderr = result.errorMessage;
-          }
-          terminateChild();
-          setTimeout(() => {
-            if (!settled) finish(124);
-          }, SIGKILL_TIMEOUT_MS + 500);
-        }, SILENCE_TIMEOUT_MS);
-        silenceTimer.unref();
-      };
-
-      const flushLine = (line: string) => {
-        if (timedOut) return;
-        if (processPiJsonLine(line, result)) emitUpdate();
-        // Reset silence timer on any JSON event — subagent is alive
-        resetSilenceTimer();
-        maybeFinishFromAgentEnd();
-      };
-
-      const flushBufferedLines = (text: string) => {
-        for (const line of text.split(/\r?\n/)) {
-          if (line.trim()) flushLine(line);
-        }
-      };
-
-      const maybeFinishFromAgentEnd = () => {
-        if (!result.sawAgentEnd || didClose || settled) return;
-        clearTimers();
-        semanticCompletionTimer = setTimeout(() => {
-          if (didClose || settled || !result.sawAgentEnd) return;
-          if (buffer.trim()) {
-            flushBufferedLines(buffer);
-            buffer = "";
-          }
-          proc.stdout.removeListener("data", onStdoutData);
-          proc.stderr.removeListener("data", onStderrData);
-          finish(0);
-          terminateChild();
-        }, AGENT_END_GRACE_MS);
-        semanticCompletionTimer.unref();
-      };
-
-      const onStdoutData = (chunk: Buffer) => {
-        buffer += chunk.toString();
-        const lines = buffer.split(/\r?\n/);
-        buffer = lines.pop() || "";
-        for (const line of lines) flushLine(line);
-      };
-
-      const onStderrData = (chunk: Buffer) => {
-        // Strip control characters (bell, escape sequences, etc.) from stderr
-        // pi --mode json -p outputs \u0007 (bell) to stderr on completion
-        const cleaned = chunk.toString().replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
-        result.stderr += cleaned;
-      };
-
-      proc.stdout.on("data", onStdoutData);
-      proc.stderr.on("data", onStderrData);
-
-      // Silence timer — starts when process spawns, resets on each event
-      resetSilenceTimer();
-
-      // Max execution safety net — fires once, never resets
-      maxExecutionTimer = setTimeout(() => {
-        if (didClose || settled) return;
-        timedOut = true;
-        result.timeout = true;
-        result.stopReason = "timeout";
-        result.exitCode = 124;
-        // Flush buffered data before killing (preserve partial output)
-        if (buffer.trim()) flushBufferedLines(buffer);
-        result.errorMessage = `Sub-agent exceeded max execution time (${MAX_EXECUTION_MS / 1000 / 60}min, ${result.usage.turns} turns).`;
-        if (!result.stderr.trim()) {
-          result.stderr = result.errorMessage;
-        }
-        terminateChild();
-        setTimeout(() => {
-          if (!settled) finish(124);
-        }, SIGKILL_TIMEOUT_MS + 500);
-      }, MAX_EXECUTION_MS);
-      maxExecutionTimer.unref();
-
-      proc.on("close", (code) => {
-        didClose = true;
-        clearTimers();
-        if (buffer.trim()) flushBufferedLines(buffer);
-        finish(code ?? 0);
-      });
-
-      proc.on("error", (err) => {
-        if (!result.stderr.trim()) result.stderr = err.message;
-        clearTimers();
-        finish(1);
-      });
-
-      // Abort handling
-      if (signal) {
-        abortHandler = () => {
-          if (didClose || settled) return;
-          wasAborted = true;
-          clearTimers();
-          terminateChild();
-        };
-        if (signal.aborted) abortHandler();
-        else signal.addEventListener("abort", abortHandler, { once: true });
-      }
-    });
-
-    result.exitCode = exitCode;
-    return normalizeCompletedResult(result, wasAborted);
+    attempt++;
   }
+
+  return finalResult;
 }

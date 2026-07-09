@@ -91,6 +91,24 @@ export function isResultError(r: SingleResult): boolean {
 	return !isResultSuccess(r);
 }
 
+/**
+ * Whether a result represents a potentially RECOVERABLE failure.
+ * Recoverable means: process was killed by signal or hit a limit,
+ * but the task itself may succeed on retry with adjusted params.
+ *
+ * Non-recoverable: exit code 1 from LLM crash, invalid input, etc.
+ */
+export function isResultRecoverable(r: SingleResult): boolean {
+	if (!isResultError(r)) return false;
+	return (
+		r.stopReason === "timeout" ||
+		r.stopReason === "max_turns" ||
+		r.stopReason === "sigterm" ||
+		r.exitCode === 143 || // SIGTERM
+		r.exitCode === 130    // SIGINT / aborted
+	);
+}
+
 /** Reconcile process exit status with semantic completion observed from Pi's event stream. */
 export function normalizeCompletedResult(result: SingleResult, wasAborted: boolean): SingleResult {
 	const hasSemanticSuccess = hasSemanticCompletion(result);
@@ -121,6 +139,15 @@ export function normalizeCompletedResult(result: SingleResult, wasAborted: boole
 		return result;
 	}
 
+	// Detect SIGTERM (exit 143 = 128 + 15) — process was killed by signal.
+	// Classify as recoverable: worth retry before surfacing failure.
+	if (!result.stopReason && result.exitCode === 143) {
+		result.stopReason = "sigterm";
+		result.errorMessage = result.errorMessage || `Sub-agent killed by SIGTERM (exit 143). Process did not exit cleanly — likely wall-clock timeout or system signal.`;
+		if (!result.stderr.trim()) result.stderr = result.errorMessage;
+		return result;
+	}
+
 	if (result.maxTurns && result.usage.turns >= result.maxTurns) {
 		result.exitCode = 1;
 		result.stopReason = "max_turns";
@@ -147,6 +174,23 @@ export function normalizeCompletedResult(result: SingleResult, wasAborted: boole
 	}
 
 	return result;
+}
+
+/** Extract the last tool call made by the sub-agent (for debugging). */
+export function getLastToolCall(messages: Message[]): { name: string; args: Record<string, unknown> } | null {
+	if (!Array.isArray(messages)) return null;
+	// Walk messages in reverse to find most recent tool call
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const msg = messages[i];
+		if (!msg || msg.role !== "assistant" || !Array.isArray(msg.content)) continue;
+		for (let j = msg.content.length - 1; j >= 0; j--) {
+			const part = msg.content[j];
+			if (part?.type === "toolCall" && typeof part.name === "string") {
+				return { name: part.name, args: part.arguments ?? {} };
+			}
+		}
+	}
+	return null;
 }
 
 /** Extract the last assistant text from a message history. */
