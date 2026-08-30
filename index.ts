@@ -5,8 +5,9 @@
  *
  * Simplified design:
  * - Sub-agents identified by a freeform name (no config files)
- * - Sub-agents inherit the exact same system prompt and session context as the main agent
- * - Sub-agents cannot spawn further sub-agents (enforced at runner level)
+ * - Sub-agents inherit the system prompt and the provider+model, but NOT the parent
+ *   conversation: they run an empty ephemeral session and receive only the task string
+ * - Sub-agents cannot spawn further sub-agents (child marker env + runner kill)
  * - No named agents, no tool sets, no model overrides
  *
  * This preserves KV cache stability: the main agent's KV cache prefix
@@ -17,7 +18,7 @@ import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { renderCall, renderResult } from "./render.js";
 import { getFinalAssistantText, getResultSummaryText } from "./runner-events.js";
-import { runAgent } from "./runner.js";
+import { runAgent, SUBAGENT_CHILD_ENV } from "./runner.js";
 import {
 	type SingleResult,
 	emptyUsage,
@@ -86,6 +87,73 @@ function analyzeTaskSize(
 }
 
 // ---------------------------------------------------------------------------
+// Concurrency gate
+// ---------------------------------------------------------------------------
+
+/**
+ * Everything here is self-hosted: one llama.cpp server, 4 slots sharing a single KV
+ * context (150k on the `mac` box, 110k on the `linux` box). Concurrent sub-agents
+ * contend for that compute and evict each other's cached prefix — measured 17s/turn
+ * solo vs ~60s/turn each with 3 in flight — so locally we cannot afford concurrency:
+ * exactly ONE child at a time, extra calls queue.
+ *
+ * PI_SUBAGENT_MAX_PARALLEL exists only for a remote/paid provider; leave it alone here.
+ */
+const MAX_PARALLEL = Math.max(1, Number(process.env.PI_SUBAGENT_MAX_PARALLEL ?? 1) || 1);
+let activeChildren = 0;
+const slotWaiters: Array<() => void> = [];
+
+async function acquireSlot(): Promise<void> {
+	if (activeChildren >= MAX_PARALLEL) {
+		await new Promise<void>((resolve) => slotWaiters.push(resolve));
+	}
+	activeChildren++;
+}
+
+/**
+ * Turn a raw provider/stream error into something actionable. These three showed up over and
+ * over in real session logs with no explanation attached: "404 status code (no body)",
+ * "422", "Connection error.".
+ */
+function explainChildFailure(signal: string): string {
+	const s = signal.toLowerCase();
+	if (s.includes("404")) {
+		return (
+			"Hint: HTTP 404 — the provider+model the child used is not served by that inference server. " +
+			"Children inherit this session's provider+model; verify it exists there, or point children " +
+			"somewhere valid with PI_SUBAGENT_PROVIDER / PI_SUBAGENT_MODEL."
+		);
+	}
+	if (s.includes("422")) {
+		return (
+			"Hint: HTTP 422 — the server rejected the request body. On llama.cpp that is almost always " +
+			"context overflow (prompt + reserved response > n_ctx), frequently because a high thinking " +
+			"level reserves most of the context. Lower the thinking level, shorten the task, or raise n_ctx."
+		);
+	}
+	if (
+		s.includes("connection error") ||
+		s.includes("econnrefused") ||
+		s.includes("fetch failed") ||
+		s.includes("socket hang up")
+	) {
+		return (
+			"Hint: the child could not reach the inference server (wrong host/port, server restarting, or an " +
+			"endpoint missing OpenAI-compatible routes). Check that it answers /v1/models."
+		);
+	}
+	if (s.includes("context length") || s.includes("too many tokens") || s.includes("exceeds the")) {
+		return "Hint: context overflow — give the child a shorter task or a server with a larger context.";
+	}
+	return "";
+}
+
+function releaseSlot(): void {
+	activeChildren = Math.max(0, activeChildren - 1);
+	slotWaiters.shift()?.();
+}
+
+// ---------------------------------------------------------------------------
 // Helpers (inlined to avoid jiti CJS/ESM interop issues with runner-events.js)
 // ---------------------------------------------------------------------------
 
@@ -96,7 +164,7 @@ function analyzeTaskSize(
 function getAllAssistantText(messages) {
 	if (!Array.isArray(messages)) return "";
 
-	const texts = [];
+	const texts: string[] = [];
 	for (const message of messages) {
 		if (!message || message.role !== "assistant" || !Array.isArray(message.content)) {
 			continue;
@@ -125,7 +193,14 @@ function getAllAssistantText(messages) {
 const SUBAGENT_INSTRUCTIONS = `
 ## Sub-Agent Tools/Extension
 
-Since we are running all our LLMs locally, we have to use a modified version of sub-agents. This means that you may switch between main agent and sub agent mode at any point during the session. 
+Since we are running all our LLMs locally, we have to use a modified version of sub-agents. This means that you may switch between main agent and sub agent mode at any point during the session.
+
+### Hard facts about this implementation (READ BEFORE DELEGATING)
+
+1. **A sub-agent does NOT see this conversation.** It starts an empty ephemeral pi process and receives only your \`task\` string. Anything phrased as "as discussed above" is meaningless to it. Write self-contained tasks: goal, exact paths/URLs, constraints, output format.
+2. **Only one sub-agent runs at a time.** The models are self-hosted (one llama.cpp server, few slots on one shared KV cache), so concurrency is unaffordable: parallel \`subagent\` calls in a single turn do not speed anything up, they queue behind each other. Fan out sequentially — delegate one task, read the result, then delegate the next.
+3. \`timeout\` is a real wall-clock kill and \`maxTurns\` really kills the child. Partial output is returned either way.
+4. A child inherits the current provider+model and all parent tools except \`subagent\` (nested delegation is refused, and a child that tries it is killed). 
 
 You will know sub-agent mode is active when you see a user message that follows this format:
 
@@ -190,11 +265,12 @@ const SubagentParams = Type.Object({
 	}),
 	task: Type.String({
 		description:
-			"Task description. The sub-agent receives the full session context.",
+			"Task description. MUST be self-contained: the sub-agent does NOT see the parent conversation, only this string. Include goal, exact paths/URLs, constraints, expected output format.",
 	}),
 	timeout: Type.Optional(
 		Type.Number({
-			description: "Maximum execution time in seconds. Default: 600.",
+			description:
+				"Wall-clock seconds for the whole run. The child is KILLED at the deadline (partial output returned). Default: 600, hard ceiling 3600.",
 			default: 600,
 		}),
 	),
@@ -232,17 +308,38 @@ export default function (pi: ExtensionAPI) {
 		description: [
 			"Delegate work to a sub-agent running in an isolated pi process.",
 			"",
-			"The sub-agent inherits your full session context (conversation history + system prompt).",
+			"It starts an EMPTY ephemeral session: it does NOT see this conversation — only your `task` string,",
+			"so the task must be fully self-contained (goal, exact paths/URLs, constraints, output format).",
+			"It runs in the current provider+model and inherits all tools except `subagent`.",
+			"Only ONE sub-agent runs at a time (self-hosted model, shared KV cache) — extra calls queue, so delegate sequentially, not in parallel.",
 			"",
 			"Optional parameters:",
-			"  timeout: Max execution time in seconds (default: 600)",
-			"  maxTurns: Max LLM turns/calls (default: 50)",
+			"  timeout: Wall-clock seconds before the child is killed (default: 600, ceiling 3600)",
+			"  maxTurns: Max LLM turns/calls; the child is killed when exceeded (default: 50)",
 			"",
 			"Example: { name: \"researcher\", task: \"Research the latest about quantum computing\", timeout: 600 }",
 		].join("\n"),
 		parameters: SubagentParams,
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
+			// Nested delegation guard: children are spawned with PI_SUBAGENT_CHILD=1.
+			// Refusing here is the only reliable guard — the event-stream check in
+			// runner-events.js merely records the violation after the fact.
+			if (process.env[SUBAGENT_CHILD_ENV] === "1") {
+				return {
+					content: [
+						{
+							type: "text" as const,
+							text:
+								"✗ Refused: you are already a sub-agent. Nested sub-agents are not allowed. " +
+								"Do this work yourself with your own tools (read/bash/web_search/...).",
+						},
+					],
+					details: { results: [] },
+					isError: true,
+				};
+			}
+
 			const timeoutMs = (params.timeout ?? 600) * 1000;
 			const maxTurns = params.maxTurns ?? 50;
 
@@ -256,17 +353,35 @@ export default function (pi: ExtensionAPI) {
 						: `\n${taskWarning.text}`;
 			}
 
-			const result = await runAgent({
-				cwd: ctx.cwd,
-				agentName: params.name,
-				task: params.task,
-				taskCwd: params.cwd,
-				signal,
-				onUpdate,
-				makeDetails: (results) => ({ results }),
-				timeout: timeoutMs,
-				maxTurns,
-			});
+			// Serialise children on the shared inference slot unless overridden.
+			if (activeChildren >= MAX_PARALLEL) {
+				onUpdate?.({
+					content: [
+						{
+							type: "text" as const,
+							text: `queued: waiting for a free sub-agent slot (max ${MAX_PARALLEL} concurrent)`,
+						},
+					],
+					details: { results: [] },
+				});
+			}
+			await acquireSlot();
+			let result;
+			try {
+				result = await runAgent({
+					cwd: ctx.cwd,
+					agentName: params.name,
+					task: params.task,
+					taskCwd: params.cwd,
+					signal,
+					onUpdate,
+					makeDetails: (results) => ({ results }),
+					timeout: timeoutMs,
+					maxTurns,
+				});
+			} finally {
+				releaseSlot();
+			}
 
 			// Shared diagnostic helpers
 			const partialText = getAllAssistantText(result.messages);
@@ -321,6 +436,26 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			// ── Timeout ───────────────────────────────────────────────────────────
+			// ── Recursion attempt (child killed) ──────────────────────────────
+			if (result.stopReason === "subagent_recursion_blocked") {
+				const recSummary = partialText ? `Partial result:\n${partialText}\n\n` : "";
+				return {
+					content: [
+						{
+							type: "text" as const,
+							text:
+								warningPrefix +
+								`🚫 Sub-agent attempted nested delegation — ${makeDiagnosticFooter()}. Process killed.\n` +
+								`${recSummary}` +
+								`Re-issue the task with an explicit instruction not to delegate.`,
+						},
+					],
+					details: { results: [result] },
+					isError: true,
+				};
+			}
+
+			// ── Timeout ──────────────────────────────────────────────────────
 			if (result.stopReason === "timeout") {
 				const summary = partialText
 					? `Partial result before timeout:\n${partialText}\n\n`
@@ -333,7 +468,7 @@ export default function (pi: ExtensionAPI) {
 								warningPrefix +
 								`⏰ Sub-agent timed out — ${makeDiagnosticFooter()}.\n` +
 								`${summary}` +
-								`Task too broad for one sub-agent.` +
+								`Hit the ${Math.round(timeoutMs / 1000)}s wall-clock timeout. Task too broad for one sub-agent.` +
 								makeSplitGuidance(),
 						},
 					],
@@ -365,6 +500,7 @@ export default function (pi: ExtensionAPI) {
 
 			if (isResultError(result)) {
 				const displayText = partialText || getResultSummaryText(result);
+				const hint = explainChildFailure(`${result.stderr} ${result.errorMessage ?? ""}`);
 				return {
 					content: [
 						{
@@ -373,6 +509,7 @@ export default function (pi: ExtensionAPI) {
 								warningPrefix +
 								`✗ Sub-agent failed — ${makeDiagnosticFooter()}.\n` +
 								`${result.errorMessage ? result.errorMessage + "\n\n" : ""}` +
+								(hint ? hint + "\n\n" : "") +
 								(displayText && displayText !== getResultSummaryText(result) ? displayText + "\n\n" : "") +
 								(isResultRecoverable(result)
 									? "This is a recoverable failure. Try splitting the task and retrying.\n" + makeSplitGuidance()

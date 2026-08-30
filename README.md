@@ -73,6 +73,36 @@ The auto-injected system prompt instructions now include:
 - Timeout recovery guidance (partial output preserved, split-and-retry pattern)
 - Sub-agent mode rules: no quest tool (IDs meaningless), no parallel tool calls (MCP transport limitation), final message must contain full output
 
+### Hard Wall-Clock Deadline (added back)
+
+The heartbeat-only timeout cannot fire while the child is still producing output, so a child that
+keeps talking forever — or a child's own turn budget that nothing enforces — held the parent
+hanging for tens of minutes. `timeout` is now *both* budgets and the earlier one wins:
+
+* **silence**: 120 s with no streaming activity at all (upstream behaviour, unchanged), and
+* **wall clock**: `timeout` seconds total — hard `SIGTERM` → `SIGKILL`. The tool default is 600 s;
+  callers that omit `timeout` entirely get `min(10s × maxTurns, 1h)` instead of the old flat 1 h.
+
+Either trip returns partial output with `stopReason: "timeout"` and `exitCode: 124`.
+`stopReason: "max_turns"` now means the child was actually killed for spending its turn budget.
+
+### Child Lifecycle Guarantees
+
+* `abortSignal` is wired all the way down — Esc / abort kills the child instead of orphaning it.
+* children get `PI_SUBAGENT_CHILD=1`, the tool refuses any `subagent` call made inside a child,
+  and the runner kills a child that emits a `subagent` tool call — so nested delegation is blocked
+  in **every** mode (previously a child in default mode could spawn its own children, invisible to
+  the parent's timeout). New `stopReason: "subagent_recursion_blocked"`.
+* Every exit path is guaranteed to resolve: close, spawn error, abort, deadline, turn budget,
+  recursion guard. A killed child's partial text comes back with `exitCode: 130` instead of `(no output)`.
+
+### One Sub-Agent at a Time
+
+Everything here is self-hosted: one llama.cpp server, a few slots over a single shared KV context.
+Concurrent children contend for that compute and evict each other's (and the parent's) cached
+prefix — measured 17s/turn solo vs ~60s/turn each with 3 in flight. Calls are therefore serialised
+through one slot. Delegate sequentially; issuing several `subagent` calls in one turn only queues them.
+
 ## Install
 
 ```bash
@@ -110,11 +140,23 @@ There is no option to specify a model. It always uses the current session's mode
 |-----------|----------|---------|-------------|
 | `name` | Yes | — | Freeform human-like name. Used for display only. |
 | `task` | Yes | — | Task description. Make it self-contained — child doesn't see parent conversation. |
-| `timeout` | No | 600 | Maximum silence time in seconds before assuming stuck. Not wall-clock — resets on activity. |
+| `timeout` | No | 600 | Wall-clock seconds for the whole run — the child is **killed** at the deadline (partial output returned). A separate 120 s silence watchdog also applies. Ceiling 3600. |
 | `maxTurns` | No | 50 | Maximum number of LLM turns the sub-agent can make. |
 | `cwd` | No | Parent cwd | Working directory for the sub-agent process. |
 
 > **Timeout tip:** Formula is `maxTurns × 10s = min timeout`. For deep research: `maxTurns: 50, timeout: 600`.
+
+### Environment Variables
+
+All optional. Read when the extension loads, so restart pi after changing them.
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `PI_SUBAGENT_MAX_PARALLEL` | `1` | Concurrency gate. Leave at 1 on self-hosted rigs; only raise it for a remote/paid provider. |
+| `PI_SUBAGENT_MODEL` | parent's model | Force the model children run on. Point it at a second box so children stop evicting the parent's cached prompt. |
+| `PI_SUBAGENT_PROVIDER` | parent's provider | Provider for `PI_SUBAGENT_MODEL`. |
+| `PI_SUBAGENT_THINKING` | parent's level | Thinking/reasoning level for children. |
+| `PI_SUBAGENT_CHILD` | *(set by the runner)* | Marks a process as a sub-agent child; also works as a manual switch if you ever need to spawn a real sub-agent from inside one. |
 
 ### On Timeout or Max Turns
 

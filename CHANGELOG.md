@@ -7,6 +7,36 @@ This fork adds improvements focused on local LLM usage (2-10 tok/s), timeout rec
 
 ---
 
+## Unreleased — local-hosting hardening pass
+
+Found by auditing failed sub-agent calls across 173 local sessions (16 × `hit max turns`,
+4 × `timed out (exit 124)`, 2 × `failed (exit 130)`, plus unbounded parallel fan-out).
+
+| Area | File | Change |
+|---|---|---|
+| Wall-clock budget | `runner.ts` | `timeout` is enforced again as a hard deadline (`SIGTERM` → 5.5 s → `SIGKILL`) **in addition to** the 120 s silence watchdog. Buffered stdout is flushed before the kill so partial output survives. Trips report `stopReason: "timeout"`, `exitCode: 124`, and a message naming the budget. |
+| Derived budget | `runner.ts` | When the caller omits `timeout`, the cap is now `min(10s × maxTurns, 1h)` instead of a flat 1 h. (The `subagent` tool still passes 600 s explicitly by default.) |
+| One deadline for retries | `runner.ts` | The SIGTERM retry loop used to arm a fresh deadline per attempt — worst case 3 × the requested budget. `deadlineAt` is now computed once; each attempt gets the remaining window, backoff is clamped to it, and retries are skipped when < 15 s remains. |
+| Turn budget enforced | `runner.ts` | `max_turns` now kills the child (`bailOut()`); previously the flag was recorded and the runner kept waiting for the child to finish by itself. |
+| Recursion guard | `runner.ts`, `index.ts`, `types.ts` | Children get `PI_SUBAGENT_CHILD=1`; `index.ts` refuses `subagent` calls when that marker is set, and the runner kills a child that emits a `subagent` tool call (`stopReason: "subagent_recursion_blocked"`, also listed in `isResultRecoverable`). |
+| Abort | `runner.ts` | `opts.signal` is finally honoured: abort flushes buffered output, records `exitCode: 130` + partial text, kills the child, and resolves — instead of `Subagent was aborted` with `(no output)` and an orphaned process. |
+| Guaranteed resolution | `runner.ts` | Every kill path arms one `scheduleFinish()` fallback (cleared in `clearTimers()`), so the promise cannot strand; `finish()` no longer leaves `exitCode: -1` behind. All four timer handles are cleared on settle. |
+| Heartbeat | `runner.ts` | New 10 s `onUpdate` heartbeat printing `running 42s · 7 turns · last tool: bash`. Before this the only updates came from child events, so one slow turn looked like a frozen agent. |
+| Model pinning | `runner.ts` | Child receives `--provider/--model/--thinking` derived from the parent session, because pi does *not* read `PI_PROVIDER`/`PI_MODEL`/`PI_REASONING_LEVEL` — previously every child silently ran on the `settings.json` default (observed: parent on `mac`/104, children on `linux`/109). `PI_SUBAGENT_MODEL` / `PI_SUBAGENT_PROVIDER` / `PI_SUBAGENT_THINKING` override. |
+| Child env | `runner.ts` | Parent session identity vars (`PI_SESSION_ID`, `PI_SESSION_FILE`, `PI_PROVIDER`, `PI_MODEL`, `PI_REASONING_LEVEL`) are stripped — the same list pi's bash tool strips — so the child does not believe it is the parent session. |
+| Bounded stderr | `runner.ts` | stderr collection capped at 64 KB with a truncation marker. |
+| Concurrency | `index.ts` | `acquireSlot()`/`releaseSlot()` gate, `PI_SUBAGENT_MAX_PARALLEL` default **1**: one child at a time, extra calls get a `queued: waiting for a free sub-agent slot` update. Self-hosted servers cannot afford parallel children (measured 17 s/turn solo vs ~60 s/turn each with 3 in flight). |
+| Honest instructions | `index.ts` | Dropped the false "sub-agent receives the full session context" claims; the tool description and injected instructions now state that a child starts an empty session, inherits provider+model+tools except `subagent`, runs one at a time, and that `timeout`/`maxTurns` are hard kills. |
+| Error hints | `index.ts` | `explainChildFailure()` turns the three mystery errors from the session audit into hints: `404` → provider/model not served there; `422` → server rejected the body (usually context overflow, often a high thinking level); `Connection error.`/`ECONNREFUSED`/`fetch failed` → server unreachable. |
+| Small cleanup | `index.ts` | `const texts: string[]` (was inferring `never[]`). |
+
+Behaviour changes worth knowing: `timeout` now means *silence **or** wall clock, whichever comes
+first* instead of silence only; a child now **dies** at its turn budget; sub-agents run on the
+parent's provider+model instead of the settings default; and parallel `subagent` calls queue
+instead of all running at once.
+
+---
+
 ## Commits (newest first)
 
 ### 1. `refactor(index): remove session forking, add partial output recovery, update instructions`

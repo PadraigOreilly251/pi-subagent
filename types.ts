@@ -80,6 +80,9 @@ export function hasSemanticCompletion(r: Pick<SingleResult, "messages" | "sawAge
 /** Whether a result should be treated as successful by the wrapper/UI. */
 export function isResultSuccess(r: SingleResult): boolean {
 	if (r.exitCode === -1) return false;
+	// A child whose LLM call errored (provider 4xx, connection drop, ...) is never a
+	// success, even if it emitted some text before dying.
+	if (r.stopReason === "error" || r.stopReason === "subagent_recursion_blocked") return false;
 	if (r.stopReason === "timeout" || r.stopReason === "max_turns") return false;
 	if (hasSemanticCompletion(r)) return true;
 	return r.exitCode === 0 && r.stopReason !== "error" && r.stopReason !== "aborted";
@@ -104,6 +107,7 @@ export function isResultRecoverable(r: SingleResult): boolean {
 		r.stopReason === "timeout" ||
 		r.stopReason === "max_turns" ||
 		r.stopReason === "sigterm" ||
+		r.stopReason === "subagent_recursion_blocked" ||
 		r.exitCode === 143 || // SIGTERM
 		r.exitCode === 130    // SIGINT / aborted
 	);
