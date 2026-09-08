@@ -152,7 +152,7 @@ All optional. Read when the extension loads, so restart pi after changing them.
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `PI_SUBAGENT_MAX_PARALLEL` | `1` | Concurrency gate. Leave at 1 on self-hosted rigs; only raise it for a remote/paid provider. |
+| `PI_SUBAGENT_MAX_PARALLEL` | `1` | Seeds the concurrency gate. Live override via `/subconcurrency` (0 = serial/blocking, N = concurrent). Leave at 1 on self-hosted rigs; only raise it for a remote/paid provider or a separate inference box. |
 | `PI_SUBAGENT_MODEL` | parent's model | Force the model children run on. Point it at a second box so children stop evicting the parent's cached prompt. |
 | `PI_SUBAGENT_PROVIDER` | parent's provider | Provider for `PI_SUBAGENT_MODEL`. |
 | `PI_SUBAGENT_THINKING` | parent's level | Thinking/reasoning level for children. |

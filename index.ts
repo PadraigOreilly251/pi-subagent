@@ -92,19 +92,32 @@ function analyzeTaskSize(
 
 /**
  * Everything here is self-hosted: one llama.cpp server, 4 slots sharing a single KV
- * context (150k on the `mac` box, 110k on the `linux` box). Concurrent sub-agents
+ * context (150k on one host, 110k on another). Concurrent sub-agents
  * contend for that compute and evict each other's cached prefix — measured 17s/turn
- * solo vs ~60s/turn each with 3 in flight — so locally we cannot afford concurrency:
- * exactly ONE child at a time, extra calls queue.
- *
- * PI_SUBAGENT_MAX_PARALLEL exists only for a remote/paid provider; leave it alone here.
+ * solo vs ~60s/turn each with 3 in flight — so locally the safe default is serial:
+ * exactly ONE child at a time, extra calls queue. Raise the limit only if you point
+ * children at a separate inference box. PI_SUBAGENT_MAX_PARALLEL seeds the default;
+ * the /subconcurrency command changes it live (0 = serial/blocking, N = concurrent).
  */
-const MAX_PARALLEL = Math.max(1, Number(process.env.PI_SUBAGENT_MAX_PARALLEL ?? 1) || 1);
+// How many sub-agent children may run at once — live, settable via /subconcurrency.
+// 0 = serial/blocking: one child at a time, the main workflow is on hold until it
+// finishes. N = up to N children concurrent. PI_SUBAGENT_MAX_PARALLEL seeds the
+// default; /subconcurrency overrides it for the process lifetime.
+function concurrencyFromEnv(): number {
+	const raw = Number(process.env.PI_SUBAGENT_MAX_PARALLEL ?? 1);
+	return Number.isFinite(raw) && raw >= 0 ? Math.floor(raw) : 1;
+}
+let subagentConcurrency = concurrencyFromEnv();
 let activeChildren = 0;
 const slotWaiters: Array<() => void> = [];
 
+/** Effective gate: never below 1, so 0 = serial/blocking (the single child still runs). */
+function effectiveParallel(): number {
+	return Math.max(1, subagentConcurrency);
+}
+
 async function acquireSlot(): Promise<void> {
-	if (activeChildren >= MAX_PARALLEL) {
+	if (activeChildren >= effectiveParallel()) {
 		await new Promise<void>((resolve) => slotWaiters.push(resolve));
 	}
 	activeChildren++;
@@ -154,6 +167,36 @@ function releaseSlot(): void {
 }
 
 // ---------------------------------------------------------------------------
+// Model override (per session)
+// ---------------------------------------------------------------------------
+//
+// Default: children inherit the parent session's LIVE provider+model (ctx.model
+// at call time — so switching the parent mid-session is followed automatically).
+//
+// The user can pin a different pi model for children with /submodel (interactive
+// menu, no typing). The pin lives for the current session only: every
+// session_start resets it back to inherit.
+
+type ModelChoice = { provider: string; id: string };
+const INHERIT_SENTINEL = "↺ inherit parent model (default)";
+let modelOverride: ModelChoice | null = null;
+
+function describeChoice(): string {
+	return modelOverride ? `${modelOverride.provider}/${modelOverride.id} (pinned)` : "inherit parent";
+}
+
+/**
+ * Menu label for a model from the live registry: provider/id + host + context
+ * window + display name, so the user never has to type or memorise an id.
+ */
+function modelLabel(m: { provider?: string; id?: string; name?: string; baseUrl?: string; contextWindow?: number }): string {
+	const host = String(m.baseUrl ?? "").replace(/^https?:\/\//, "").replace(/\/.*/, "") || "?";
+	const ctxK = m.contextWindow ? `, ${Math.round(m.contextWindow / 1000)}k` : "";
+	const name = m.name && m.name !== m.id ? ` — ${m.name}` : "";
+	return `${m.provider}/${m.id} (${host}${ctxK})${name}`;
+}
+
+// ---------------------------------------------------------------------------
 // Helpers (inlined to avoid jiti CJS/ESM interop issues with runner-events.js)
 // ---------------------------------------------------------------------------
 
@@ -198,9 +241,9 @@ Since we are running all our LLMs locally, we have to use a modified version of 
 ### Hard facts about this implementation (READ BEFORE DELEGATING)
 
 1. **A sub-agent does NOT see this conversation.** It starts an empty ephemeral pi process and receives only your \`task\` string. Anything phrased as "as discussed above" is meaningless to it. Write self-contained tasks: goal, exact paths/URLs, constraints, output format.
-2. **Only one sub-agent runs at a time.** The models are self-hosted (one llama.cpp server, few slots on one shared KV cache), so concurrency is unaffordable: parallel \`subagent\` calls in a single turn do not speed anything up, they queue behind each other. Fan out sequentially — delegate one task, read the result, then delegate the next.
+2. **Sub-agent concurrency is serial by default.** One child at a time; parallel \`subagent\` calls in a single turn queue behind each other. The models are self-hosted (one llama.cpp server, few slots on one shared KV cache), so concurrency is unaffordable unless children point at a separate box — raise it only then (settable with /subconcurrency: 0 = serial/blocking, N = concurrent). Fan out sequentially — delegate one task, read the result, then delegate the next.
 3. \`timeout\` is a real wall-clock kill and \`maxTurns\` really kills the child. Partial output is returned either way.
-4. A child inherits the current provider+model and all parent tools except \`subagent\` (nested delegation is refused, and a child that tries it is killed). 
+4. A child inherits the current provider+model (or the session's /submodel pin, if the user set one) and all parent tools except \`subagent\` (nested delegation is refused, and a child that tries it is killed). Success results carry a \`⚙ subagent model:\` note when a pin is active. 
 
 You will know sub-agent mode is active when you see a user message that follows this format:
 
@@ -301,6 +344,12 @@ export default function (pi: ExtensionAPI) {
 		};
 	});
 
+	// The model pin is per-session: a fresh session (or resume of another one)
+	// goes back to inheriting the parent's live model.
+	pi.on("session_start", () => {
+		modelOverride = null;
+	});
+
 	// Register the subagent tool
 	pi.registerTool({
 		name: "subagent",
@@ -311,7 +360,7 @@ export default function (pi: ExtensionAPI) {
 			"It starts an EMPTY ephemeral session: it does NOT see this conversation — only your `task` string,",
 			"so the task must be fully self-contained (goal, exact paths/URLs, constraints, output format).",
 			"It runs in the current provider+model and inherits all tools except `subagent`.",
-			"Only ONE sub-agent runs at a time (self-hosted model, shared KV cache) — extra calls queue, so delegate sequentially, not in parallel.",
+			"Sub-agent concurrency is serial by default (settable via /subconcurrency — 0 = serial/blocking, N = concurrent). Self-hosted model, shared KV cache — extra calls queue, so delegate sequentially unless children point at a separate box.",
 			"",
 			"Optional parameters:",
 			"  timeout: Wall-clock seconds before the child is killed (default: 600, ceiling 3600)",
@@ -354,12 +403,12 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			// Serialise children on the shared inference slot unless overridden.
-			if (activeChildren >= MAX_PARALLEL) {
+			if (activeChildren >= effectiveParallel()) {
 				onUpdate?.({
 					content: [
 						{
 							type: "text" as const,
-							text: `queued: waiting for a free sub-agent slot (max ${MAX_PARALLEL} concurrent)`,
+							text: `queued: waiting for a free sub-agent slot (max ${effectiveParallel()} concurrent)`,
 						},
 					],
 					details: { results: [] },
@@ -378,6 +427,13 @@ export default function (pi: ExtensionAPI) {
 					makeDetails: (results) => ({ results }),
 					timeout: timeoutMs,
 					maxTurns,
+					// Model pin (/submodel) wins; otherwise the live session's provider+model —
+					// NOT the settings.json default. The pi process does NOT carry PI_MODEL/
+					// PI_PROVIDER in its own process.env (those are injected into bash-tool
+					// children by bash.ts), so reading process.env.PI_MODEL silently fell
+					// through to settings.json's defaultModel — every child 404'd.
+					modelProvider: (modelOverride ?? ctx.model)?.provider,
+					modelId: (modelOverride ?? ctx.model)?.id,
 				});
 			} finally {
 				releaseSlot();
@@ -522,11 +578,14 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			// Success path
+			const overrideNote = modelOverride
+				? `\n\n⚙ subagent model: ${modelOverride.provider}/${modelOverride.id} (pinned via /submodel)`
+				: "";
 			return {
 				content: [
 					{
 						type: "text" as const,
-						text: partialText || getResultSummaryText(result) || "Sub-agent completed successfully.",
+						text: (partialText || getResultSummaryText(result) || "Sub-agent completed successfully.") + overrideNote,
 					},
 				],
 				details: { results: [result] },
@@ -536,5 +595,109 @@ export default function (pi: ExtensionAPI) {
 	renderCall: (args, theme) => renderCall(args, theme),
 	renderResult: (result, { expanded }, theme) =>
 		renderResult(result, expanded, theme),
+	});
+
+	// -----------------------------------------------------------------------
+	// /submodel — interactive menu to pick which model sub-agent children run on.
+	// No arg: open the picker. "reset" (alias "clear"): back to inheriting the
+	// parent's live model. "show": print current choice.
+	// -----------------------------------------------------------------------
+	pi.registerCommand("submodel", {
+		description:
+			"Pick the model sub-agent children run on (menu; no typing). Default: inherit the parent's current model. Args: 'reset' = inherit, 'show' = current.",
+		handler: async (args, ctx) => {
+			const arg = args.trim().toLowerCase();
+
+			if (arg === "reset" || arg === "clear" || arg === "inherit") {
+				modelOverride = null;
+				ctx.ui.setStatus("subagent", undefined);
+				ctx.ui.notify("subagent model: inherit parent's current model (default)", "info");
+				return;
+			}
+			if (arg === "show") {
+				ctx.ui.notify(`subagent model: ${describeChoice()}`, "info");
+				return;
+			}
+			if (arg) {
+				ctx.ui.notify(`unknown /submodel arg '${args.trim()}' — menu (no arg), 'show', or 'reset'`, "warning");
+				return;
+			}
+			if (!ctx.hasUI) {
+				ctx.ui.notify("/submodel menu needs the interactive TUI (not available in print mode). Use '/submodel reset'.", "error");
+				return;
+			}
+
+			// Live model catalogue from the session's registry (same data /model shows).
+			let models: Array<ModelChoice & { label: string }> = [];
+			try {
+				const all = ctx.modelRegistry?.getAvailable?.() ?? ctx.modelRegistry?.getAll?.() ?? [];
+				models = all
+					.filter((m) => typeof m?.id === "string" && typeof m?.provider === "string")
+					.map((m) => ({ provider: m.provider, id: m.id, label: modelLabel(m) }));
+			} catch {
+				models = [];
+			}
+			if (models.length === 0) {
+				ctx.ui.notify("no models in the session model registry — check your provider config", "error");
+				return;
+			}
+			const options = [INHERIT_SENTINEL, ...models.map((m) => m.label)];
+			const choice = await ctx.ui.select(`Subagent model (current: ${describeChoice()})`, options);
+			if (choice === undefined) return; // user cancelled
+
+			if (choice === INHERIT_SENTINEL) {
+				modelOverride = null;
+				ctx.ui.setStatus("subagent", undefined);
+				ctx.ui.notify("subagent model: inherit parent's current model (default)", "info");
+				return;
+			}
+			const hit = models.find((m) => m.label === choice);
+			if (!hit) return;
+			modelOverride = { provider: hit.provider, id: hit.id };
+			ctx.ui.setStatus("subagent", `subagent: ${hit.provider}/${hit.id}`);
+			ctx.ui.notify(`subagent model: ${hit.provider}/${hit.id}`, "info");
+		},
+	});
+
+	// -----------------------------------------------------------------------
+	// /subconcurrency (alias /submodelnumber) — how many sub-agent children may
+	// run at once. 0 = serial/blocking (main workflow on hold until the child
+	// finishes). N = up to N concurrent. No arg: show current.
+	// -----------------------------------------------------------------------
+	const subconcurrencyHandler = async (args: string, ctx) => {
+		const arg = args.trim();
+		if (!arg) {
+			const desc =
+				subagentConcurrency === 0
+					? "0 (serial — main workflow on hold until the child finishes)"
+					: `${subagentConcurrency} (up to ${subagentConcurrency} concurrent)`;
+			ctx.ui.notify(`subagent concurrency: ${desc}`, "info");
+			return;
+		}
+		const n = Number(arg);
+		if (!Number.isFinite(n) || n < 0 || !Number.isInteger(n)) {
+			ctx.ui.notify(`invalid /subconcurrency '${arg}' — use an integer 0..N (0 = serial/blocking)`, "error");
+			return;
+		}
+		subagentConcurrency = n;
+		if (n === 1) ctx.ui.setStatus("subagent-conc", undefined);
+		else if (n === 0) ctx.ui.setStatus("subagent-conc", "subagent: serial");
+		else ctx.ui.setStatus("subagent-conc", `subagent: ${n} concurrent`);
+		const desc =
+			n === 0
+				? "0 (serial — main workflow on hold until the child finishes)"
+				: `${n} (up to ${n} concurrent)`;
+		ctx.ui.notify(`subagent concurrency: ${desc}`, "info");
+	};
+
+	pi.registerCommand("subconcurrency", {
+		description:
+			"Set how many sub-agent children run at once. 0 = serial/blocking (main workflow on hold until the child finishes), N = up to N concurrent. No arg: show current.",
+		handler: subconcurrencyHandler,
+	});
+	pi.registerCommand("submodelnumber", {
+		description:
+			"Alias for /subconcurrency — set how many sub-agent children run at once (0 = serial/blocking, N = concurrent).",
+		handler: subconcurrencyHandler,
 	});
 }

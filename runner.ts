@@ -91,6 +91,7 @@ const inheritedCliArgs = parseInheritedCliArgs(process.argv);
 function buildPiArgs(
   task: string,
   taskCwd: string | undefined,
+  sessionModel?: { provider?: string; id?: string },
 ): string[] {
   const args: string[] = [
     "--mode",
@@ -104,14 +105,24 @@ function buildPiArgs(
   // Pin the child to the parent's model. pi does NOT read PI_MODEL/PI_PROVIDER
   // (those are exported *to* child commands, not consumed), so without this every
   // sub-agent silently ran on settings.json's default model instead of the session's
-  // (observed live: parent on mac/104, child on Linux/109).
+  // (observed live: parent on one inference host, child on another).
   //
   // PI_SUBAGENT_MODEL / PI_SUBAGENT_PROVIDER override that — useful on self-hosted rigs:
   // one llama.cpp box has few slots on one shared KV context, so pointing children at a
   // second box stops them from evicting the parent's cached prompt.
+  // Prefer the live session's model (from ctx.model in the tool handler). The pi process
+  // does not carry PI_MODEL/PI_PROVIDER in its own process.env — those are injected into
+  // bash-tool children by bash.ts — so falling back to process.env.PI_MODEL silently
+  // selected settings.json's defaultModel (e.g. "Linux") and every child 404'd.
   const model =
-    process.env.PI_SUBAGENT_MODEL ?? inheritedCliArgs.fallbackModel ?? process.env.PI_MODEL;
-  const provider = process.env.PI_SUBAGENT_PROVIDER ?? process.env.PI_PROVIDER;
+    sessionModel?.id ??
+    process.env.PI_SUBAGENT_MODEL ??
+    inheritedCliArgs.fallbackModel ??
+    process.env.PI_MODEL;
+  const provider =
+    sessionModel?.provider ??
+    process.env.PI_SUBAGENT_PROVIDER ??
+    process.env.PI_PROVIDER;
   if (model && !inheritedCliArgs.alwaysProxy.includes("--model")) {
     if (provider) args.push("--provider", provider);
     args.push("--model", model);
@@ -163,6 +174,13 @@ export interface RunAgentOptions {
   timeout?: number;
   /** Maximum number of assistant turns (LLM calls). Default: 50. */
   maxTurns?: number;
+  /**
+   * The live session's provider and model id (from the tool handler's ctx.model).
+   * pi does NOT carry PI_MODEL/PI_PROVIDER in its own process.env, so without these
+   * the child silently fell back to settings.json's defaultModel and 404'd.
+   */
+  modelProvider?: string;
+  modelId?: string;
 }
 
 /**
@@ -502,7 +520,10 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
   } = opts;
 
   const workDir = taskCwd ?? cwd;
-  const piArgs = buildPiArgs(task, taskCwd);
+  const piArgs = buildPiArgs(task, taskCwd, {
+    provider: opts.modelProvider,
+    id: opts.modelId,
+  });
   // Honour the requested wall-clock timeout; MAX_EXECUTION_MS stays as an absolute net.
   // When no timeout is given, derive one from the turn budget (the documented
   // maxTurns × 10s formula) instead of falling through to a flat hour — an hour of a
