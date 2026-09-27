@@ -627,18 +627,58 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			// Live model catalogue from the session's registry (same data /model shows).
+			// Same list pi's /model shows. /model awaits a catalogue refresh before
+			// listing (its open-time refresh, 15 s budget) because getAvailable() is a
+			// SYNCHRONOUS snapshot that can predate the initial availability pass (per-
+			// provider auth checks) — reading it cold under-lists or under-reports models.
+			// Mirror that refresh here, then read the snapshot.
+			ctx.ui.setStatus("submodel-refresh", "submodel: refreshing model catalog…");
+			try {
+				const controller = new AbortController();
+				const timer = setTimeout(() => controller.abort(), 15_000);
+				try {
+					await ctx.modelRegistry?.refresh?.({ signal: controller.signal });
+				} finally {
+					clearTimeout(timer);
+				}
+			} catch {
+				// Refresh failed/timed out — proceed with the cached snapshot.
+			}
+			ctx.ui.setStatus("submodel-refresh", undefined);
+
+			// Respect session scoping (enabledModels / --models): /model only lists the
+			// scoped subset when scoping is configured (empty = all available).
+			const scoped: readonly { model?: { provider?: string; id?: string } }[] =
+				(ctx as { scopedModels?: readonly { model?: { provider?: string; id?: string } }[] }).scopedModels ?? [];
+			const scopedIds = scoped.length > 0
+				? new Set(scoped.map((s) => `${s.model?.provider}/${s.model?.id}`))
+				: undefined;
+
 			let models: Array<ModelChoice & { label: string }> = [];
 			try {
-				const all = ctx.modelRegistry?.getAvailable?.() ?? ctx.modelRegistry?.getAll?.() ?? [];
+				let all = ctx.modelRegistry?.getAvailable?.() ?? ctx.modelRegistry?.getAll?.() ?? [];
+				if (scopedIds) all = all.filter((m) => scopedIds.has(`${m.provider}/${m.id}`));
 				models = all
 					.filter((m) => typeof m?.id === "string" && typeof m?.provider === "string")
 					.map((m) => ({ provider: m.provider, id: m.id, label: modelLabel(m) }));
 			} catch {
 				models = [];
 			}
+			// Match /model ordering: current session model first, then by provider/id.
+			const current = ctx.model;
+			models.sort((a, b) => {
+				const aCurrent = current && a.provider === current.provider && a.id === current.id ? 0 : 1;
+				const bCurrent = current && b.provider === current.provider && b.id === current.id ? 0 : 1;
+				if (aCurrent !== bCurrent) return aCurrent - bCurrent;
+				return a.provider.localeCompare(b.provider) || a.id.localeCompare(b.id);
+			});
 			if (models.length === 0) {
-				ctx.ui.notify("no models in the session model registry — check your provider config", "error");
+				ctx.ui.notify(
+					scopedIds
+						? "scoped models not found in the refreshed model catalogue — check your --models/enabledModels config"
+						: "no models in the session model registry — check your provider config",
+					"error",
+				);
 				return;
 			}
 			const options = [INHERIT_SENTINEL, ...models.map((m) => m.label)];
