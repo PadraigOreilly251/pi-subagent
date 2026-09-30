@@ -34,6 +34,10 @@ export interface SingleResult {
 	stopReason?: string;
 	errorMessage?: string;
 	sawAgentEnd?: boolean;
+	/** RPC mode: child emitted agent_settled (Pi will not continue automatically). */
+	sawAgentSettled?: boolean;
+	/** What pi did with the sub-agent prompt (RPC prompt response). */
+	promptDisposition?: "started" | "queued" | "handled";
 	timeout?: boolean;
 	maxTurns?: number;
 }

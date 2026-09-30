@@ -187,3 +187,87 @@ test("maxTurns enforcement stops processing when limit is reached", () => {
   assert.equal(result.stopReason, "max_turns");
   assert.equal(result.errorMessage, "Sub-agent exceeded maximum turns (3)");
 });
+
+// ---------------------------------------------------------------------------
+// RPC mode: agent_settled gate + prompt response matching
+// ---------------------------------------------------------------------------
+
+import { matchPromptResponse } from "../runner-events.js";
+
+test("processPiEvent sets sawAgentSettled on agent_settled", () => {
+  const result = makeResult();
+  processPiEvent({ type: "agent_settled" }, result);
+  assert.equal(result.sawAgentSettled, true);
+});
+
+test("processPiEvent does not set sawAgentSettled for other events", () => {
+  const result = makeResult();
+  processPiEvent({ type: "agent_end" }, result);
+  assert.equal(result.sawAgentEnd, true);
+  assert.equal(result.sawAgentSettled, undefined);
+});
+
+test("matchPromptResponse matches the prompt response by id", () => {
+  const line = JSON.stringify({
+    id: "subagent-abc",
+    type: "response",
+    command: "prompt",
+    success: true,
+    data: { disposition: "started" },
+  });
+  const m = matchPromptResponse(line, "subagent-abc");
+  assert.equal(m.success, true);
+  assert.equal(m.disposition, "started");
+});
+
+test("matchPromptResponse matches a rejected prompt (success false)", () => {
+  const line = JSON.stringify({
+    id: "subagent-abc",
+    type: "response",
+    command: "prompt",
+    success: false,
+    error: "Model not found: bogus/model",
+  });
+  const m = matchPromptResponse(line, "subagent-abc");
+  assert.equal(m.success, false);
+  assert.equal(m.error, "Model not found: bogus/model");
+  assert.equal(m.disposition, undefined);
+});
+
+test("matchPromptResponse ignores other commands and foreign ids", () => {
+  assert.equal(
+    matchPromptResponse(
+      JSON.stringify({ id: "subagent-abc", type: "response", command: "abort", success: true }),
+      "subagent-abc",
+    ),
+    null,
+  );
+  assert.equal(
+    matchPromptResponse(
+      JSON.stringify({
+        id: "someone-else",
+        type: "response",
+        command: "prompt",
+        success: true,
+        data: { disposition: "started" },
+      }),
+      "subagent-abc",
+    ),
+    null,
+  );
+});
+
+test("matchPromptResponse accepts a response without id", () => {
+  const m = matchPromptResponse(
+    JSON.stringify({ type: "response", command: "prompt", success: true, data: { disposition: "handled" } }),
+    "subagent-abc",
+  );
+  assert.equal(m.success, true);
+  assert.equal(m.disposition, "handled");
+});
+
+test("matchPromptResponse tolerates non-JSON and event lines", () => {
+  assert.equal(matchPromptResponse("not json {", "subagent-abc"), null);
+  assert.equal(matchPromptResponse(JSON.stringify({ type: "agent_settled" }), "subagent-abc"), null);
+  assert.equal(matchPromptResponse("", "subagent-abc"), null);
+});

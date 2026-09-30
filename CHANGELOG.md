@@ -7,6 +7,25 @@ This fork adds improvements focused on local LLM usage (2-10 tok/s), timeout rec
 
 ---
 
+## Unreleased — RPC mode + prompt disposition (pi ≥ 0.99.0)
+
+Children now run `pi --mode rpc --no-session` instead of `--mode json -p`; the task is
+delivered as a `prompt` command over stdin (RPC mode rejects positional prompts) and the
+prompt response's `disposition` drives what the parent waits for.
+
+| Area | File | Change |
+|---|---|---|
+| RPC protocol | `runner.ts` | Child is a long-lived server: stdin stays open, task is a `prompt` command (correlated by id), completion gate is `agent_settled` (Pi will not continue automatically) instead of `agent_end` (one low-level run — retries/compaction/steering can follow). |
+| Disposition | `runner.ts`, `runner-events.js`, `types.ts` | `started`/`queued` → wait for `agent_settled` (normal path). `handled` → an extension command/input handler consumed the prompt, so `agent_settled` will never come: a 10 s grace window, and if no agent activity appears the child is killed with `stopReason: "prompt_handled"` instead of waiting out the 120 s silence timer. `success: false` (rejected before acceptance — missing API key, prompt during compaction) → **fail fast** with `stopReason: "prompt_rejected"` and pi's error text; previously this hung 120 s and reported a "timeout" for a prompt that never ran. |
+| Orderly shutdown | `runner.ts` | `terminateChild()` closes the child's stdin first (pi's RPC shutdown contract — it disposes its runtime and exits), SIGTERM only after 2.5 s if it ignores the close. |
+| Test seam | `runner.ts` | `PI_SUBAGENT_BIN` override for the pi binary (standalone test processes have no parent bundle to derive it from). |
+
+Live-verified against pi 0.99.1: happy path (started → settled, clean exit in 6 s),
+post-acceptance provider 404 (error in stream, fast), pre-acceptance rejection
+(`prompt_rejected` in 0.6 s). E2E harness: `e2e-rpc.mjs` (with `register-ts-bridge.mjs` / `ts-bridge-loader.mjs` for running the runner under raw node).
+
+---
+
 ## Unreleased — local-hosting hardening pass
 
 Found by auditing failed sub-agent calls across 173 local sessions (16 × `hit max turns`,

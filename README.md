@@ -157,6 +157,7 @@ All optional. Read when the extension loads, so restart pi after changing them.
 | `PI_SUBAGENT_PROVIDER` | parent's provider | Provider for `PI_SUBAGENT_MODEL`. |
 | `PI_SUBAGENT_THINKING` | parent's level | Thinking/reasoning level for children. |
 | `PI_SUBAGENT_CHILD` | *(set by the runner)* | Marks a process as a sub-agent child; also works as a manual switch if you ever need to spawn a real sub-agent from inside one. |
+| `PI_SUBAGENT_BIN` | parent's bundle | Explicit pi binary for the child (test seam — standalone test processes have no parent bundle to derive it from). |
 
 ### On Timeout or Max Turns
 
@@ -172,12 +173,27 @@ This lets you recover partial work instead of starting from scratch.
 **What Gets Sent to Sub-Agents:**
 
 ```
-[Fresh pi process, --no-session]
+[Fresh pi process, --mode rpc, --no-session]
 [Same system prompt as the main agent (inherited via CLI)]
 
-User: [sub-agent-task] Complete this task:
-{task description}
+stdin: {"type":"prompt","message":"[sub-agent-task] Complete this task: ..."}
 ```
+
+The child is an RPC server, not a one-shot print run. The task goes over stdin as a
+`prompt` command (pi ≥ 0.99.0), and the prompt response's `disposition` tells the
+parent what to wait for:
+
+| Disposition | Meaning | Runner behaviour |
+|---|---|---|
+| `started` | pi accepted the prompt and started a run | wait for `agent_settled` (the normal path) |
+| `queued` | pi queued it during an active run | wait for `agent_settled` |
+| `handled` | an extension command/input handler consumed it — no run started | 10 s grace; if no agent activity, kill with `stopReason: "prompt_handled"` |
+| `success: false` | rejected before acceptance (missing API key, prompt during compaction) | fail fast: `stopReason: "prompt_rejected"` with pi's error — no 120 s hang |
+
+Completion is gated on `agent_settled` (Pi will not continue automatically), not
+`agent_end` (one low-level run — retries, overflow recovery, compaction, and steering
+can still follow it). Shutdown is orderly: the child's stdin is closed first (pi
+disposes its runtime and exits); SIGTERM only if it ignores the close.
 
 **What Comes Back to the Main Agent:**
 
@@ -195,6 +211,7 @@ User: [sub-agent-task] Complete this task:
 - **Partial Output Recovery** — On timeout or max turns, all accumulated text is returned with recovery guidance.
 - **Full Output Extraction** — Text from ALL assistant messages, not just the last one.
 - **Auto-Injection** — Sub-agent instructions injected into system prompt at startup (constant text, KV cache stable).
+- **RPC Protocol + Disposition** — child runs `pi --mode rpc`; the prompt response's disposition (`started`/`queued`/`handled`) plus `agent_settled` replace guesswork with an explicit wait contract. Rejected prompts fail fast instead of hanging 120 s.
 - **Recursion Guard** — Sub-agents cannot spawn further sub-agents. Enforced at runner level.
 - **Streaming Updates** — Watch sub-agent progress in real-time.
 - **Rich TUI Rendering** — Collapsed/expanded views with usage stats and tool call previews.

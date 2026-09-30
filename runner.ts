@@ -14,12 +14,21 @@
  * - SIGTERM auto-retry: killed subagents retry up to 2x with exponential backoff
  * - Silence detection: kills stuck processes after 120s of no stdout at all
  * - Heartbeat updates: UI refreshes every 10s so a slow turn does not look frozen
+ * - RPC protocol: child runs `pi --mode rpc --no-session`; the task is delivered
+ *   as a `prompt` command over stdin (RPC mode rejects positional prompts). The
+ *   prompt response's `disposition` ("started" | "queued" | "handled") tells the
+ *   parent what to wait for; a `success: false` response (rejected before
+ *   acceptance) fails fast instead of hanging out the 120s silence timer.
+ * - Completion gate: `agent_settled` (Pi will not continue automatically), not
+ *   `agent_end` (one low-level run; retries/compaction/steering can follow).
+ * - Orderly shutdown: stdin close first (pi's RPC shutdown contract), SIGTERM
+ *   fallback after 2.5s.
  */
 
 import { spawn } from "node:child_process";
 import type { AgentToolResult } from "@mariozechner/pi-agent-core";
 import { parseInheritedCliArgs } from "./runner-cli.js";
-import { processPiJsonLine } from "./runner-events.js";
+import { matchPromptResponse, processPiJsonLine } from "./runner-events.js";
 import {
   type SingleResult,
   emptyUsage,
@@ -56,6 +65,19 @@ const SIGTERM_BASE_DELAY_MS = 5000;
  */
 const SILENCE_TIMEOUT_MS = 120_000;
 
+/**
+ * Grace window after a `handled` prompt disposition. "handled" means an extension
+ * command / input handler consumed the prompt and NO run started for it. If
+ * agent activity appears within this window, something did run (the extension's
+ * own work); if nothing does, the task never ran and we bail instead of waiting
+ * out the 120s silence timer.
+ */
+const HANDLED_GRACE_MS = 10_000;
+
+/** Orderly-shutdown window: stdin close → SIGTERM delay (pi disposes its runtime
+ * on stdin close before exiting; SIGTERM is the fallback). */
+const STDIN_SHUTDOWN_MS = 2500;
+
 /** Upper bound on collected stderr (a looping child must not grow memory without limit). */
 const MAX_STDERR_BYTES = 64 * 1024;
 
@@ -75,6 +97,12 @@ type OnUpdateCallback = (partial: AgentToolResult) => void;
 // ---------------------------------------------------------------------------
 
 function resolvePiSpawn(): { command: string; prefixArgs: string[] } {
+  // Test/harness override: point at an explicit pi binary. Normally the child is
+  // derived from the parent's own bundle (node + argv[1]); a standalone test
+  // process has no such bundle, so it sets PI_SUBAGENT_BIN instead.
+  if (process.env.PI_SUBAGENT_BIN) {
+    return { command: process.env.PI_SUBAGENT_BIN, prefixArgs: [] };
+  }
   const isNode = /[\\/]node(?:\.exe)?$/i.test(process.execPath);
   if (isNode && process.argv[1]) {
     return { command: process.execPath, prefixArgs: [process.argv[1]] };
@@ -95,10 +123,9 @@ function buildPiArgs(
 ): string[] {
   const args: string[] = [
     "--mode",
-    "json",
+    "rpc",
     ...inheritedCliArgs.extensionArgs,
     ...inheritedCliArgs.alwaysProxy,
-    "-p",
     "--no-session",
   ];
 
@@ -140,8 +167,10 @@ function buildPiArgs(
     args.push("--tools", inheritedCliArgs.fallbackTools);
   }
 
-  const taskMessage = `[sub-agent-task] Complete this task:\n${task}`;
-  args.push(taskMessage);
+  // The task is NOT a CLI argument: RPC mode rejects positional prompts. It is
+  // delivered as a `prompt` command over stdin by runSingleAttempt(), whose
+  // response carries the disposition.
+  void task; // task moved to stdin delivery (see runSingleAttempt)
   return args;
 }
 
@@ -190,6 +219,7 @@ export interface RunAgentOptions {
 function runSingleAttempt(
   result: SingleResult,
   piArgs: string[],
+  taskMessage: string,
   workDir: string,
   signal: AbortSignal | undefined,
   onUpdate: OnUpdateCallback | undefined,
@@ -229,11 +259,6 @@ function runSingleAttempt(
       env: childEnv,
     });
 
-    proc.stdin.on("error", () => {
-      /* ignore broken pipe on fast exits */
-    });
-    proc.stdin.end();
-
     let buffer = "";
     let didClose = false;
     let settled = false;
@@ -246,6 +271,26 @@ function runSingleAttempt(
     // settles) but always cleared in clearTimers() so it cannot outlive the call.
     let finishGraceTimer: NodeJS.Timeout | undefined;
     let stderrBytes = 0;
+    // RPC: the child is a long-lived server — keep stdin open and deliver the
+    // task as a `prompt` command. Correlate the response by id for the
+    // disposition.
+    const promptId = `subagent-${Math.random().toString(36).slice(2, 10)}`;
+    let handledGraceTimer: NodeJS.Timeout | undefined;
+
+    proc.stdin.on("error", () => {
+      /* ignore broken pipe on fast exits */
+    });
+    proc.stdin.write(
+      JSON.stringify({ id: promptId, type: "prompt", message: taskMessage }) + "\n",
+      (err) => {
+        if (err && !didClose && !settled) {
+          // stdin broke before the prompt was accepted — the child is gone.
+          if (!result.stderr.trim()) result.stderr = err.message;
+          terminateChild();
+          scheduleFinish(1);
+        }
+      },
+    );
 
     const emitUpdate = () => {
       const elapsed = Math.round((Date.now() - startedAt) / 1000);
@@ -265,6 +310,10 @@ function runSingleAttempt(
     };
 
     const clearTimers = () => {
+      if (handledGraceTimer) {
+        clearTimeout(handledGraceTimer);
+        handledGraceTimer = undefined;
+      }
       if (semanticCompletionTimer) {
         clearTimeout(semanticCompletionTimer);
         semanticCompletionTimer = undefined;
@@ -298,21 +347,32 @@ function runSingleAttempt(
 
 
     const terminateChild = () => {
-      if (isWindows) {
-        if (proc.pid !== undefined) {
-          const killer = spawn("taskkill", ["/T", "/F", "/PID", String(proc.pid)], {
-            stdio: "ignore",
-          });
-          killer.unref();
-        }
-        return;
+      // Orderly shutdown first: closing stdin makes pi dispose its runtime and
+      // exit (RPC shutdown contract). SIGTERM stays as the fallback in case the
+      // child ignores the close.
+      try {
+        proc.stdin.end();
+      } catch {
+        /* stdin already ended */
       }
-
-      proc.kill("SIGTERM");
-      const sigkillTimer = setTimeout(() => {
-        if (!didClose) proc.kill("SIGKILL");
-      }, SIGKILL_TIMEOUT_MS);
-      sigkillTimer.unref();
+      const termDelay = setTimeout(() => {
+        if (didClose) return;
+        if (isWindows) {
+          if (proc.pid !== undefined) {
+            const killer = spawn("taskkill", ["/T", "/F", "/PID", String(proc.pid)], {
+              stdio: "ignore",
+            });
+            killer.unref();
+          }
+          return;
+        }
+        proc.kill("SIGTERM");
+        const sigkillTimer = setTimeout(() => {
+          if (!didClose) proc.kill("SIGKILL");
+        }, SIGKILL_TIMEOUT_MS);
+        sigkillTimer.unref();
+      }, STDIN_SHUTDOWN_MS);
+      termDelay.unref();
     };
 
     const finish = (code: number) => {
@@ -365,8 +425,51 @@ function runSingleAttempt(
       scheduleFinish(1);
     };
 
+    const handlePromptResponse = (r: {
+      success: boolean;
+      disposition?: "started" | "queued" | "handled";
+      error?: string;
+    }) => {
+      if (settled || didClose) return;
+      if (r.success === false) {
+        // Rejected before acceptance (missing model/API key, prompt during
+        // compaction, ...). Fail fast — the old path hung until the 120s
+        // silence timer and reported a "timeout" for a prompt that never ran.
+        timedOut = true;
+        result.stopReason = "prompt_rejected";
+        if (!result.errorMessage) {
+          result.errorMessage = `Sub-agent prompt rejected by pi: ${r.error ?? "unknown reason"}`;
+        }
+        if (!result.stderr.trim()) result.stderr = result.errorMessage;
+        if (result.exitCode === -1 || result.exitCode === 0) result.exitCode = 1;
+        terminateChild();
+        scheduleFinish(1);
+        return;
+      }
+      result.promptDisposition = r.disposition;
+      if (r.disposition === "handled") {
+        // An extension command / input handler consumed the prompt — no run
+        // started for this input, so agent_settled will never come. Give
+        // extension-driven activity a grace window; if nothing runs, bail.
+        handledGraceTimer = setTimeout(() => {
+          handledGraceTimer = undefined;
+          if (didClose || settled) return;
+          if (result.usage.turns === 0 && !result.sawAgentEnd && !result.sawAgentSettled) {
+            result.stopReason = "prompt_handled";
+            bailOut(
+              "Sub-agent prompt was consumed by an extension input handler; no run started for the task.",
+            );
+          }
+        }, HANDLED_GRACE_MS);
+        handledGraceTimer.unref();
+      }
+      // "started" / "queued": normal path — wait for agent_settled.
+    };
+
     const flushLine = (line: string) => {
       if (timedOut) return;
+      const promptResponse = matchPromptResponse(line, promptId);
+      if (promptResponse) handlePromptResponse(promptResponse);
       if (processPiJsonLine(line, result)) emitUpdate();
       // Reset silence timer on any JSON event — subagent is alive
       resetSilenceTimer();
@@ -394,7 +497,10 @@ function runSingleAttempt(
     };
 
     const maybeFinishFromAgentEnd = () => {
-      if (!result.sawAgentEnd || didClose || settled) return;
+      // RPC completion gate: agent_settled, not agent_end — agent_end marks one
+      // low-level run, and retries / overflow recovery / compaction / steering
+      // can still follow it. Settled means Pi will not continue automatically.
+      if (!result.sawAgentSettled || didClose || settled) return;
       clearTimers();
       semanticCompletionTimer = setTimeout(() => {
         if (didClose || settled || !result.sawAgentEnd) return;
@@ -578,9 +684,11 @@ export async function runAgent(opts: RunAgentOptions): Promise<SingleResult> {
       await new Promise((r) => setTimeout(r, delay));
     }
 
+    const taskMessage = `[sub-agent-task] Complete this task:\n${task}`;
     const exitCode = await runSingleAttempt(
       result,
       piArgs,
+      taskMessage,
       workDir,
       signal,
       onUpdate,

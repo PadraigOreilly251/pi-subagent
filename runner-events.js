@@ -114,6 +114,12 @@ export function processPiEvent(event, result) {
       result.sawAgentEnd = true;
       return addAssistantMessages(result, event.messages);
 
+    case "agent_settled":
+      // RPC completion gate: Pi will not continue automatically. (agent_end
+      // alone is not enough — retries/compaction/steering can follow it.)
+      result.sawAgentSettled = true;
+      return true;
+
     default:
       return false;
   }
@@ -130,6 +136,32 @@ export function processPiJsonLine(line, result) {
   }
 
   return processPiEvent(event, result);
+}
+
+/**
+ * Match an RPC `prompt` command response on stdout, correlated by id.
+ * Returns { success, disposition, error } or null when the line is not the
+ * prompt response we are waiting for.
+ */
+export function matchPromptResponse(line, promptId) {
+  if (!line.trim()) return null;
+
+  let event;
+  try {
+    event = JSON.parse(line);
+  } catch {
+    return null;
+  }
+
+  if (!event || typeof event !== "object") return null;
+  if (event.type !== "response" || event.command !== "prompt") return null;
+  if (event.id !== undefined && event.id !== promptId) return null;
+
+  return {
+    success: Boolean(event.success),
+    disposition: event.data?.disposition,
+    error: event.error,
+  };
 }
 
 export function getFinalAssistantText(messages) {
