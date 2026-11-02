@@ -103,6 +103,35 @@ Concurrent children contend for that compute and evict each other's (and the par
 prefix — measured 17s/turn solo vs ~60s/turn each with 3 in flight. Calls are therefore serialised
 through one slot. Delegate sequentially; issuing several `subagent` calls in one turn only queues them.
 
+### Delegation Nudges (opt-in)
+
+A fact-finding pass over 100 session transcripts showed the extension was reliable (92% of 93 calls
+succeeded) but almost never *requested*: static instructions got read and ignored (~520 think-mentions,
+0.1% of tool use). Nudges fix the timing problem — one-line, situationally-true reminders delivered at
+the moment of decision, never touching the system prompt (append-only transcript deltas keep the KV cache
+stable — this is **additive to** the existing constant instruction injection).
+
+Off by default. Enable with `PI_SUBAGENT_NUDGE=1` or `/subnudge on` (session-scoped).
+
+| Trigger | Fires when | Delivery |
+| --- | --- | --- |
+| `big-result` | a single tool result ≥ 25 KB of text | footer appended to that result, pre-filled with the file/URL subject |
+| `context` | context usage ≥ 60% of the model window (tracked from assistant `usage`) | custom transcript entry before the run starts |
+| `streak` | ≥ 5 inline web/doc research calls since the last delegation | custom transcript entry before the run starts |
+| `batch` | user prompt contains ≥ 3 enumerated items | custom transcript entry before the run starts |
+
+Every nudge carries the **live extension parameters** (`model=inherit/pinned …`, concurrency, serial
+vs pool, nudge `n`/`max`) plus a ready-to-run `subagent({...})` template it was pre-filled from the
+trigger. Anti-spam: 10 min cooldown, 5 per session, silent after the cap. **Operator veto:** a message
+like "don't use subagents" / "stop delegating" disables nudges for the session (`/subnudge on` clears
+it). Children never nudge (`PI_SUBAGENT_CHILD=1` skips the controller entirely).
+
+Validation trail: every nudge, conversion (a `subagent` call within 30 min of a nudge), veto, and
+toggle is persisted via `appendEntry("subagent_nudge", …)` — count conversions vs ignored nudges in
+the session file to decide whether to keep the feature on.
+
+Code: `nudge-rules.js` (pure, unit-tested), `nudge.ts` (event wiring), `/subnudge on|off|status`.
+
 ## Install
 
 ```bash
@@ -157,6 +186,7 @@ All optional. Read when the extension loads, so restart pi after changing them.
 | `PI_SUBAGENT_PROVIDER` | parent's provider | Provider for `PI_SUBAGENT_MODEL`. |
 | `PI_SUBAGENT_THINKING` | parent's level | Thinking/reasoning level for children. |
 | `PI_SUBAGENT_CHILD` | *(set by the runner)* | Marks a process as a sub-agent child; also works as a manual switch if you ever need to spawn a real sub-agent from inside one. |
+| `PI_SUBAGENT_NUDGE` | `0` | Set to `1` to enable delegation nudges (big-result / context pressure / research streak / batch shape). `/subnudge on\|off\|status` toggles live. |
 | `PI_SUBAGENT_BIN` | parent's bundle | Explicit pi binary for the child (test seam — standalone test processes have no parent bundle to derive it from). |
 
 ### On Timeout or Max Turns

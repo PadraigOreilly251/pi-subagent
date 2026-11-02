@@ -26,6 +26,7 @@ import {
 	isResultRecoverable,
 	getLastToolCall,
 } from "./types.js";
+import { attachNudgeController } from "./nudge.js";
 
 // ---------------------------------------------------------------------------
 // Task size analysis
@@ -740,4 +741,14 @@ export default function (pi: ExtensionAPI) {
 			"Alias for /subconcurrency — set how many sub-agent children run at once (0 = serial/blocking, N = concurrent).",
 		handler: subconcurrencyHandler,
 	});
+
+	// Delegation nudges: event-gated, situationally-true reminders toward subagent use.
+	// Off by default; PI_SUBAGENT_NUDGE=1 or /subnudge on enables. Never touches the
+	// system prompt (footer on big results + custom transcript entries).
+	attachNudgeController(pi, (ctx) => ({
+		modelText: modelOverride
+			? `pinned ${modelOverride.provider}/${modelOverride.id}`
+			: `inherit ${ctx.model?.id ?? "?"}`,
+		concurrency: subagentConcurrency,
+	}));
 }
